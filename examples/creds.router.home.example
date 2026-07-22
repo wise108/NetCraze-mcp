@@ -1,0 +1,8 @@
+# router.home — скопируйте в ~/.config/mcp-netcraze/creds.router.home
+# cp examples/creds.router.home.example ~/.config/mcp-netcraze/creds.router.home
+# chmod 600 ~/.config/mcp-netcraze/creds.router.home
+#
+export NETCRAZE_HOST="192.168.0.1"
+export NETCRAZE_USER="admin"
+export NETCRAZE_PASS="ВАШ_ПАРОЛЬ"
+export NETCRAZE_SAFE_MODE="true"
