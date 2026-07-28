@@ -84,25 +84,45 @@ async def test_get_system_info_omits_none_fields(mock_client):
 
 async def test_list_components_marks_installed_and_filters(mock_client):
     mock_client.rci_get.return_value = {
-        "ndw": {"components": "usb,storage,tsmb"},
+        "ndw": {"components": "usb,storage,tsmb,usblte"},
     }
     mock_client.rci.return_value = {
         "components": {"list": {"component": {
-            "usb": {"group": "Base system", "description": {"RU": "USB"}, "version": "1"},
-            "ftp": {"group": "Storage", "description": {"EN": "FTP"}, "version": "1", "size": "100"},
-            "wireguard": {"group": "Networking", "description": {"RU": "WG"}},
+            "usb": {"group": "Base system", "description": {"RU": "USB"}, "version": "1", "queued": True},
+            "ftp": {"group": "Storage", "description": {"EN": "FTP"}, "version": "1", "size": "100", "queued": False},
+            "usblte": {"group": "USB modems", "description": {"RU": "LTE"}, "queued": True},
+            "wireguard": {"group": "Networking", "description": {"RU": "WG"}, "queued": False},
         }}}
     }
     all_components = await list_components()
-    assert [item["name"] for item in all_components] == ["usb", "ftp", "wireguard"]
+    assert [item["name"] for item in all_components] == ["usb", "usblte", "ftp", "wireguard"]
     assert all_components[0]["installed"] is True
-    assert all_components[1]["installed"] is False
+    assert "queued" not in all_components[0]  # steady state: queued==installed
 
     storage_only = await list_components(group="Storage")
     assert [item["name"] for item in storage_only] == ["ftp"]
 
+    usb_like = await list_components(group="usb")
+    assert [item["name"] for item in usb_like] == ["usb", "usblte"]
+
     installed_only = await list_components(installed_only=True)
-    assert [item["name"] for item in installed_only] == ["usb"]
+    assert [item["name"] for item in installed_only] == ["usb", "usblte"]
+
+
+async def test_list_components_pending_queue(mock_client):
+    mock_client.rci_get.return_value = {"ndw": {"components": "usb"}}
+    mock_client.rci.return_value = {
+        "components": {"list": {"component": {
+            "usb": {"group": "Base system", "queued": True},
+            "ftp": {"group": "Storage", "queued": True},  # pending install
+        }}}
+    }
+    result = await list_components()
+    by_name = {item["name"]: item for item in result}
+    assert "queued" not in by_name["usb"]
+    assert by_name["ftp"]["queued"] is True
+    assert by_name["ftp"]["pending"] == "install"
+    assert by_name["ftp"]["installed"] is False
 
 
 async def test_get_firmware_info(mock_client):
@@ -154,6 +174,74 @@ async def test_list_usb_storage(mock_client):
     assert result[0]["partitions"][0]["free_bytes"] == 102965248
 
 
+async def test_list_usb_storage_falls_back_to_post_and_list_shape(mock_client):
+    mock_client.rci_get.return_value = {}
+    mock_client.rci.side_effect = [
+        {
+            "show": {
+                "media": [
+                    {
+                        "name": "Media0",
+                        "bus": "usb",
+                        "state": "ACTIVE",
+                        "ejectable": True,
+                        "partition": {"Partition1": {"id": "Partition1", "fstype": "ntfs", "state": "MOUNTED"}},
+                    }
+                ]
+            }
+        },
+        {"ls": {"entry": {}}},  # no storage: — only USB from media
+    ]
+    result = await list_usb_storage()
+    assert result[0]["id"] == "Media0"
+    assert result[0]["ejectable"] is True
+    assert mock_client.rci.call_args_list[0].args[0] == {"show": {"media": {}}}
+    assert mock_client.rci.call_args_list[1].args[0] == {"ls": {}}
+
+
+async def test_list_usb_storage_adds_internal_from_ls_when_media_empty(mock_client):
+    mock_client.rci_get.return_value = {}
+    mock_client.rci.side_effect = [
+        {"show": {"media": {}}},
+        {
+            "ls": {
+                "entry": {
+                    "storage:": {
+                        "type": "V",
+                        "dirty": "no",
+                        "free": "102965248",
+                        "fstype": "ubifs",
+                        "mounted": "yes",
+                        "storage": "none",
+                        "total": "102989824",
+                    }
+                }
+            }
+        },
+    ]
+    result = await list_usb_storage()
+    assert len(result) == 1
+    assert result[0]["id"] == "FlashStorage"
+    assert result[0]["bus"] == "mtd"
+    assert result[0]["ejectable"] is False
+    assert result[0]["partitions"][0]["fstype"] == "ubifs"
+    assert result[0]["partitions"][0]["free_bytes"] == 102965248
+
+
+async def test_list_usb_storage_skips_ls_when_flash_already_in_media(mock_client):
+    mock_client.rci_get.return_value = {
+        "FlashStorage": {
+            "bus": "mtd",
+            "state": "ACTIVE",
+            "ejectable": False,
+            "partition": {"Partition1": {"id": "Partition1", "fstype": "ubifs", "total": "1", "free": "1"}},
+        }
+    }
+    result = await list_usb_storage()
+    assert len(result) == 1
+    mock_client.rci.assert_not_called()
+
+
 async def test_list_shares(mock_client):
     mock_client.rci_get.return_value = {
         "enabled": False,
@@ -180,6 +268,27 @@ async def test_list_shares(mock_client):
 async def test_list_printers_empty(mock_client):
     mock_client.rci_get.return_value = {}
     assert await list_printers() == []
+
+
+async def test_list_printers_dict_map(mock_client):
+    mock_client.rci_get.return_value = {
+        "printer": {
+            "03f0:1d17": {
+                "name": "Hewlett-Packard hp LaserJet 1320",
+                "status": "OFFLINE",
+                "type": "direct",
+                "attached": False,
+            }
+        }
+    }
+    result = await list_printers()
+    assert result == [{
+        "id": "03f0:1d17",
+        "name": "Hewlett-Packard hp LaserJet 1320",
+        "state": "OFFLINE",
+        "type": "direct",
+        "attached": False,
+    }]
 
 
 async def test_install_component_queues_and_commits(mock_client):
@@ -234,9 +343,13 @@ async def test_unmount_usb_ejects(mock_client):
     mock_client.rci_get.return_value = {
         "Media0": {"bus": "usb", "ejectable": True, "partition": {}},
     }
+    mock_client.rci.side_effect = [
+        {"ls": {"entry": {}}},
+        {"system": {"eject": {"name": "Media0"}}},
+    ]
     result = await unmount_usb("Media0")
     assert result == {"ejected": True, "device": "Media0"}
-    mock_client.rci.assert_called_once_with({"system": {"eject": {"name": "Media0"}}})
+    assert mock_client.rci.call_args_list[-1].args[0] == {"system": {"eject": {"name": "Media0"}}}
 
 
 # ─── get_interfaces ───────────────────────────────────────────────────────────

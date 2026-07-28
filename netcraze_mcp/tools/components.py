@@ -11,8 +11,20 @@ def _component_description(meta: dict) -> str:
     return str(desc or "")
 
 
+def _group_matches(needle: str, component_group: str, name: str) -> bool:
+    """Substring match on group or component name (usb → USB modems, usb, usblte…)."""
+    if not needle:
+        return True
+    q = needle.lower()
+    return q in component_group.lower() or q in name.lower()
+
+
 async def list_components(installed_only: bool = False, group: str = "") -> list[dict]:
-    """List NDMS components (installed and available), optionally filtered by group."""
+    """List NDMS components (installed and available), optionally filtered by group.
+
+    group — substring match (case-insensitive) on group name or component name.
+    Examples: Storage, USB, Base system, usb (matches USB modems + usb*).
+    """
     async with _get_client() as client:
         version = await client.rci_get("show/version")
         catalog = await client.rci({"components": {"list": {}}})
@@ -33,8 +45,14 @@ async def list_components(installed_only: bool = False, group: str = "") -> list
         if installed_only and not is_installed:
             continue
         component_group = str(meta.get("group") or "")
-        if group and component_group.lower() != group.lower():
+        if not _group_matches(group, component_group, name):
             continue
+        # RCI "queued" means "selected in current set", not pending op.
+        # It equals installed in steady state — only expose real pending changes.
+        selected = meta.get("queued")
+        pending = None
+        if isinstance(selected, bool) and selected != is_installed:
+            pending = "install" if selected else "remove"
         entry = {
             key: value
             for key, value in {
@@ -44,7 +62,8 @@ async def list_components(installed_only: bool = False, group: str = "") -> list
                 "description": _component_description(meta) or None,
                 "version": meta.get("version"),
                 "size": int(meta["size"]) if str(meta.get("size") or "").isdigit() else meta.get("size"),
-                "queued": meta.get("queued"),
+                "queued": True if pending else None,
+                "pending": pending,
             }.items()
             if value is not None
         }

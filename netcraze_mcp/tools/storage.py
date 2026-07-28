@@ -39,33 +39,117 @@ def _partitions(raw) -> list[dict]:
     return result
 
 
+def _media_items(data) -> list[tuple[str, dict]]:
+    """Normalize show media payload: dict map, list, or wrapped {show:{media}} / {media}."""
+    if isinstance(data, dict):
+        if "show" in data and isinstance(data.get("show"), dict) and "media" in data["show"]:
+            data = data["show"]["media"]
+        elif list(data.keys()) == ["media"]:
+            data = data["media"]
+    if data in (None, {}, []):
+        return []
+    if isinstance(data, list):
+        items = []
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                continue
+            device_id = str(item.get("name") or item.get("id") or f"media{index}")
+            items.append((device_id, item))
+        return items
+    if isinstance(data, dict):
+        return [(str(device_id), item) for device_id, item in data.items() if isinstance(item, dict)]
+    return []
+
+
+def _device_entry(device_id: str, item: dict) -> dict:
+    return {
+        key: value
+        for key, value in {
+            "id": device_id,
+            "bus": item.get("bus"),
+            "state": item.get("state"),
+            "manufacturer": item.get("manufacturer"),
+            "product": item.get("product"),
+            "serial": item.get("serial"),
+            "size_bytes": _as_int(item.get("size")),
+            "removable": item.get("removable"),
+            "ejectable": item.get("ejectable"),
+            "partitions": _partitions(item.get("partition")),
+        }.items()
+        if value is not None and value != []
+    }
+
+
+def _device_from_ls_storage(ls_payload) -> dict | None:
+    """Built-in flash from RCI ls entry storage: (same source as UI «Встроенное хранилище»).
+
+    On some firmwares (e.g. 5.0.x) show media is empty while ls storage: still has UBIFS.
+    """
+    if not isinstance(ls_payload, dict):
+        return None
+    root = ls_payload.get("ls") if isinstance(ls_payload.get("ls"), dict) else ls_payload
+    raw = (root.get("entry") or {}).get("storage:")
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("fstype") is None and raw.get("total") is None:
+        return None
+    mounted = str(raw.get("mounted") or "").lower() in ("yes", "y", "true", "1")
+    total = _as_int(raw.get("total"))
+    free = _as_int(raw.get("free"))
+    bus = raw.get("storage")
+    if bus in (None, "", "none"):
+        bus = "mtd"
+    partition = {
+        key: value
+        for key, value in {
+            "id": "Partition1",
+            "label": raw.get("label") or "Storage",
+            "fstype": raw.get("fstype"),
+            "state": "MOUNTED" if mounted else "UNMOUNTED",
+            "total_bytes": total,
+            "free_bytes": free,
+        }.items()
+        if value is not None and value != ""
+    }
+    return {
+        key: value
+        for key, value in {
+            "id": "FlashStorage",
+            "bus": bus,
+            "state": "ACTIVE" if mounted else "INACTIVE",
+            "size_bytes": total,
+            "removable": False,
+            "ejectable": False,
+            "partitions": [partition] if partition else [],
+        }.items()
+        if value is not None and value != []
+    }
+
+
+def _has_internal_storage(devices: list[dict]) -> bool:
+    return any(
+        item.get("id") == "FlashStorage" or item.get("bus") == "mtd"
+        for item in devices
+    )
+
+
 async def list_usb_storage() -> list[dict]:
-    """List media/USB storage devices and partitions from show media."""
+    """List media/USB storage and built-in flash.
+
+    Primary source: show media. If internal flash is missing there (common on
+    some 5.0.x builds), fall back to ls entry storage: — same as the web UI.
+    """
     async with _get_client() as client:
         data = await client.rci_get("show/media")
-    if not isinstance(data, dict):
-        return []
-    result = []
-    for device_id, item in data.items():
-        if not isinstance(item, dict):
-            continue
-        entry = {
-            key: value
-            for key, value in {
-                "id": device_id,
-                "bus": item.get("bus"),
-                "state": item.get("state"),
-                "manufacturer": item.get("manufacturer"),
-                "product": item.get("product"),
-                "serial": item.get("serial"),
-                "size_bytes": _as_int(item.get("size")),
-                "removable": item.get("removable"),
-                "ejectable": item.get("ejectable"),
-                "partitions": _partitions(item.get("partition")),
-            }.items()
-            if value is not None and value != []
-        }
-        result.append(entry)
+        items = _media_items(data)
+        if not items:
+            posted = await client.rci({"show": {"media": {}}})
+            items = _media_items(posted)
+        result = [_device_entry(device_id, item) for device_id, item in items]
+        if not _has_internal_storage(result):
+            internal = _device_from_ls_storage(await client.rci({"ls": {}}))
+            if internal:
+                result.append(internal)
     result.sort(key=lambda item: item.get("id", ""))
     return result
 
@@ -117,9 +201,16 @@ async def list_printers() -> list[dict]:
         return []
     if isinstance(data, dict):
         if "printer" in data:
-            items = data.get("printer") or []
-            if not isinstance(items, list):
-                items = [items] if items else []
+            raw = data.get("printer") or {}
+            if isinstance(raw, dict):
+                items = [
+                    {**value, "id": key} if isinstance(value, dict) else value
+                    for key, value in raw.items()
+                ]
+            elif isinstance(raw, list):
+                items = raw
+            else:
+                items = [raw] if raw else []
         else:
             items = [
                 {**value, "id": key} if isinstance(value, dict) else value
@@ -142,6 +233,8 @@ async def list_printers() -> list[dict]:
                 "manufacturer": item.get("manufacturer"),
                 "product": item.get("product"),
                 "state": item.get("state") or item.get("status"),
+                "type": item.get("type"),
+                "attached": item.get("attached"),
                 "interface": item.get("interface"),
                 "share": item.get("share"),
             }.items()
