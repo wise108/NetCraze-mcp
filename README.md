@@ -14,6 +14,14 @@ MCP-сервер для роутеров **NetCraze** — управление �
 | `add_static_host` | Добавить host и сохранить конфигурацию |
 | `delete_static_host` | Удалить host по имени и сохранить конфигурацию |
 
+### Static IP routes (NetCraze)
+
+| Инструмент | Описание |
+|---|---|
+| `list_static_routes` | Список configured static routes (`show sc ip route`) |
+| `add_static_route` | Добавить `ip route` (CIDR + gateway + interface) и save |
+| `delete_static_route` | Удалить по destination CIDR или index и save |
+
 ### Система, сеть, DNS-маршрутизация (upstream)
 
 `get_system_info`, `reboot`, `get_interfaces`, `get_interface`, `get_connected_clients`, `get_wifi_associations`, `get_speed`, `get_routes`, `get_wan_status`, `get_wan_speed`, `get_domain_lists`, `get_domain_list`, `create_domain_list`, `delete_domain_list`, `set_domain_list`, `add_domains`, `remove_domains`, `get_dns_routes`, `add_dns_route`, `delete_dns_route`, `set_interface_state`
@@ -107,6 +115,7 @@ netcraze_mcp/
     network.py       # interfaces, clients, WAN, routes
     dns_routes.py    # domain lists, DNS routing
     static_hosts.py  # list/add/delete static hosts
+    static_routes.py # list/add/delete static IP routes
 tests/
   test_tools.py
 ```

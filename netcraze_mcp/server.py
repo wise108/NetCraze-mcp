@@ -29,6 +29,7 @@ from .tools.network import (
     set_interface_state,
 )
 from .tools.static_hosts import add_static_host, delete_static_host, list_static_hosts
+from .tools.static_routes import add_static_route, delete_static_route, list_static_routes
 from .tools.system import get_system_info, reboot
 
 mcp = FastMCP("netcraze")

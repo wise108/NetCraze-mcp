@@ -32,6 +32,11 @@ from netcraze_mcp.tools.static_hosts import (
     delete_static_host,
     list_static_hosts,
 )
+from netcraze_mcp.tools.static_routes import (
+    add_static_route,
+    delete_static_route,
+    list_static_routes,
+)
 from netcraze_mcp.tools.system import get_system_info, reboot
 
 
@@ -442,6 +447,85 @@ async def test_delete_static_host_by_name(mock_client):
     assert result["deleted"] is True
     mock_client.rci.assert_called_once_with([
         {"ip": {"host": {"domain": "router.home", "address": "192.168.0.1", "no": True}}},
+        {"system": {"configuration": {"save": {}}}},
+    ])
+
+
+# ─── static routes ────────────────────────────────────────────────────────────
+
+async def test_list_static_routes(mock_client):
+    mock_client.rci_get.return_value = [
+        {
+            "network": "192.168.10.0",
+            "mask": "255.255.255.0",
+            "gateway": "10.211.114.1",
+            "interface": "ZeroTier0",
+            "index": "abc",
+            "comment": "",
+        }
+    ]
+    result = await list_static_routes()
+    assert result == [{
+        "destination": "192.168.10.0/24",
+        "network": "192.168.10.0",
+        "mask": "255.255.255.0",
+        "gateway": "10.211.114.1",
+        "interface": "ZeroTier0",
+        "index": "abc",
+    }]
+
+
+async def test_add_static_route_sends_batch(mock_client):
+    result = await add_static_route(
+        "192.168.10.0/24",
+        "10.211.114.1",
+        "ZeroTier0",
+        metric=1000,
+    )
+    assert result["added"] is True
+    assert result["destination"] == "192.168.10.0/24"
+    mock_client.rci.assert_called_once_with([
+        {"ip": {"route": {
+            "network": "192.168.10.0",
+            "mask": "255.255.255.0",
+            "gateway": "10.211.114.1",
+            "interface": "ZeroTier0",
+            "metric": 1000,
+        }}},
+        {"system": {"configuration": {"save": {}}}},
+    ])
+
+
+async def test_add_static_route_safe_mode(mock_client):
+    configure(safe_mode=True)
+    with pytest.raises(PermissionError):
+        await add_static_route("192.168.10.0/24", "10.211.114.1", "ZeroTier0")
+
+
+async def test_add_static_route_raises_on_rci_error(mock_client):
+    mock_client.rci.return_value = [{
+        "ip": {"route": {"status": [{"status": "error", "message": "no input [http/rci]."}]}}
+    }]
+    with pytest.raises(RuntimeError, match="no input"):
+        await add_static_route("192.168.10.0/24", "10.211.114.1", "ZeroTier0")
+
+
+async def test_delete_static_route_by_destination(mock_client):
+    mock_client.rci_get.return_value = [{
+        "network": "192.168.10.0",
+        "mask": "255.255.255.0",
+        "gateway": "10.211.114.1",
+        "interface": "ZeroTier0",
+        "index": "abc",
+    }]
+    result = await delete_static_route(destination="192.168.10.0/24")
+    assert result["deleted"] is True
+    mock_client.rci.assert_called_once_with([
+        {"ip": {"route": {
+            "network": "192.168.10.0",
+            "mask": "255.255.255.0",
+            "no": True,
+        }}},
         {"system": {"configuration": {"save": {}}}},
     ])
 

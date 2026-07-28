@@ -3,7 +3,7 @@
 import ipaddress
 import re
 
-from ..client import _get_client
+from ..client import _get_client, _raise_on_rci_errors
 from ..config import assert_writable
 
 
@@ -66,28 +66,6 @@ def _normalize_static_entries(data) -> list[dict]:
         seen.add(key)
         result.append(entry)
     return result
-
-
-def _raise_on_rci_errors(data) -> None:
-    """RCI returns HTTP 200 even on command errors — fail if status=error."""
-    errors: list[str] = []
-
-    def walk(value) -> None:
-        if isinstance(value, dict):
-            status = value.get("status")
-            if isinstance(status, list):
-                for item in status:
-                    if isinstance(item, dict) and item.get("status") == "error":
-                        errors.append(str(item.get("message") or item))
-            for item in value.values():
-                walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
-    walk(data)
-    if errors:
-        raise RuntimeError("; ".join(errors))
 
 
 async def list_static_hosts(sort_by: str = "", order: str = "asc") -> list[dict]:

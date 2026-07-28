@@ -7,6 +7,7 @@ import netcraze_mcp.config as config
 import netcraze_mcp.tools.dns_routes as dns_routes_tools
 import netcraze_mcp.tools.network as network_tools
 import netcraze_mcp.tools.static_hosts as static_hosts_tools
+import netcraze_mcp.tools.static_routes as static_routes_tools
 import netcraze_mcp.tools.system as system_tools
 
 
@@ -42,6 +43,7 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
         network_tools,
         dns_routes_tools,
         static_hosts_tools,
+        static_routes_tools,
     ):
         monkeypatch.setattr(module, "_get_client", getter)
 

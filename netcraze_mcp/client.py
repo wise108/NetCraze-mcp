@@ -83,3 +83,25 @@ def _sanitize_error(e: Exception) -> str:
         r"\1=<redacted>",
         msg,
     )
+
+
+def _raise_on_rci_errors(data: Any) -> None:
+    """RCI returns HTTP 200 even on command errors — fail if status=error."""
+    errors: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            status = value.get("status")
+            if isinstance(status, list):
+                for item in status:
+                    if isinstance(item, dict) and item.get("status") == "error":
+                        errors.append(str(item.get("message") or item))
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(data)
+    if errors:
+        raise RuntimeError("; ".join(errors))
