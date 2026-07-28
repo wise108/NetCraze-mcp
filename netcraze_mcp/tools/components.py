@@ -1,6 +1,7 @@
 """Firmware and NDMS component tools."""
 
-from ..client import _get_client
+from ..client import _get_client, _raise_on_rci_errors
+from ..config import assert_writable
 
 
 def _component_description(meta: dict) -> str:
@@ -81,6 +82,40 @@ async def get_firmware_info() -> dict:
     }
 
 
+async def install_component(name: str, commit: bool = True) -> dict:
+    """Queue NDMS component for install; optionally run components commit."""
+    assert_writable()
+    if not name.strip():
+        raise ValueError("Component name is required")
+    async with _get_client() as client:
+        resp = await client.rci({"parse": f"components install {name.strip()}"})
+        _raise_on_rci_errors(resp)
+        committed = False
+        if commit:
+            commit_resp = await client.rci({"parse": "components commit"})
+            _raise_on_rci_errors(commit_resp)
+            committed = True
+    return {"queued": True, "name": name.strip(), "action": "install", "committed": committed}
+
+
+async def remove_component(name: str, commit: bool = True) -> dict:
+    """Queue NDMS component for removal; optionally run components commit."""
+    assert_writable()
+    if not name.strip():
+        raise ValueError("Component name is required")
+    async with _get_client() as client:
+        resp = await client.rci({"parse": f"components remove {name.strip()}"})
+        _raise_on_rci_errors(resp)
+        committed = False
+        if commit:
+            commit_resp = await client.rci({"parse": "components commit"})
+            _raise_on_rci_errors(commit_resp)
+            committed = True
+    return {"queued": True, "name": name.strip(), "action": "remove", "committed": committed}
+
+
 def register(mcp) -> None:
     mcp.tool()(list_components)
     mcp.tool()(get_firmware_info)
+    mcp.tool()(install_component)
+    mcp.tool()(remove_component)

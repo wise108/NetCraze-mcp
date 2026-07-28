@@ -4,7 +4,12 @@ import asyncio
 import pytest
 from netcraze_mcp.client import _sanitize_error
 from netcraze_mcp.config import configure
-from netcraze_mcp.tools.components import get_firmware_info, list_components
+from netcraze_mcp.tools.components import (
+    get_firmware_info,
+    install_component,
+    list_components,
+    remove_component,
+)
 from netcraze_mcp.tools.dns_routes import (
     add_dns_route,
     add_domains,
@@ -38,7 +43,14 @@ from netcraze_mcp.tools.static_routes import (
     delete_static_route,
     list_static_routes,
 )
-from netcraze_mcp.tools.storage import list_printers, list_shares, list_usb_storage
+from netcraze_mcp.tools.storage import (
+    delete_share,
+    list_printers,
+    list_shares,
+    list_usb_storage,
+    set_share,
+    unmount_usb,
+)
 from netcraze_mcp.tools.system import get_system_info, reboot
 
 
@@ -168,6 +180,63 @@ async def test_list_shares(mock_client):
 async def test_list_printers_empty(mock_client):
     mock_client.rci_get.return_value = {}
     assert await list_printers() == []
+
+
+async def test_install_component_queues_and_commits(mock_client):
+    result = await install_component("ftp", commit=True)
+    assert result == {"queued": True, "name": "ftp", "action": "install", "committed": True}
+    assert mock_client.rci.call_args_list[0].args[0] == {"parse": "components install ftp"}
+    assert mock_client.rci.call_args_list[1].args[0] == {"parse": "components commit"}
+
+
+async def test_install_component_safe_mode(mock_client):
+    configure(safe_mode=True)
+    with pytest.raises(PermissionError):
+        await install_component("ftp")
+
+
+async def test_remove_component_without_commit(mock_client):
+    result = await remove_component("ftp", commit=False)
+    assert result["committed"] is False
+    mock_client.rci.assert_called_once_with({"parse": "components remove ftp"})
+
+
+async def test_set_share_sends_batch(mock_client):
+    result = await set_share("Backup", "ABC:", description="disk")
+    assert result["added"] is True
+    mock_client.rci.assert_called_once_with([
+        {"cifs": {"share": {"label": "Backup", "mount": "ABC:", "description": "disk"}}},
+        {"system": {"configuration": {"save": {}}}},
+    ])
+
+
+async def test_delete_share_by_label(mock_client):
+    mock_client.rci_get.return_value = {
+        "share": [{"label": "Backup", "mount": "ABC:", "active": False}],
+    }
+    result = await delete_share("Backup")
+    assert result["deleted"] is True
+    mock_client.rci.assert_called_once_with([
+        {"cifs": {"share": {"label": "Backup", "mount": "ABC:", "no": True}}},
+        {"system": {"configuration": {"save": {}}}},
+    ])
+
+
+async def test_unmount_usb_refuses_non_ejectable(mock_client):
+    mock_client.rci_get.return_value = {
+        "FlashStorage": {"bus": "mtd", "ejectable": False, "partition": {}},
+    }
+    with pytest.raises(ValueError, match="not ejectable"):
+        await unmount_usb("FlashStorage")
+
+
+async def test_unmount_usb_ejects(mock_client):
+    mock_client.rci_get.return_value = {
+        "Media0": {"bus": "usb", "ejectable": True, "partition": {}},
+    }
+    result = await unmount_usb("Media0")
+    assert result == {"ejected": True, "device": "Media0"}
+    mock_client.rci.assert_called_once_with({"system": {"eject": {"name": "Media0"}}})
 
 
 # ─── get_interfaces ───────────────────────────────────────────────────────────

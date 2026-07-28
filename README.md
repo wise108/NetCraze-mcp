@@ -28,9 +28,15 @@ MCP-сервер для роутеров **NetCraze** — управление �
 |---|---|
 | `list_components` | NDMS-компоненты (installed/available), фильтр `group` / `installed_only` |
 | `get_firmware_info` | Версия прошивки, sandbox/channel, список установленных компонентов |
+| `install_component` | Поставить компонент (`commit=true` запускает установку) |
+| `remove_component` | Удалить компонент (`commit=true` применяет удаление) |
 | `list_usb_storage` | Накопители и разделы из `show media` |
+| `unmount_usb` | Безопасно извлечь USB (`system eject`), только ejectable |
 | `list_shares` | SMB/CIFS-шары из `show cifs` |
+| `set_share` / `delete_share` | Создать/удалить SMB-шару и save |
 | `list_printers` | Принтеры из `show printers` |
+
+> Remount USB после `unmount_usb` — переподключением диска (отдельной RCI mount-команды нет).
 
 ### Система, сеть, DNS-маршрутизация (upstream)
 

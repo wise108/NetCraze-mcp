@@ -1,6 +1,7 @@
 """USB storage, SMB shares and printer tools."""
 
-from ..client import _get_client
+from ..client import _get_client, _raise_on_rci_errors
+from ..config import assert_writable
 
 
 def _as_int(value):
@@ -115,7 +116,6 @@ async def list_printers() -> list[dict]:
     if data in (None, {}, []):
         return []
     if isinstance(data, dict):
-        # either {"printer": [...]} or id -> printer map
         if "printer" in data:
             items = data.get("printer") or []
             if not isinstance(items, list):
@@ -150,7 +150,66 @@ async def list_printers() -> list[dict]:
     return result
 
 
+async def set_share(label: str, mount: str, description: str = "") -> dict:
+    """Create or update SMB/CIFS share and save configuration."""
+    assert_writable()
+    if not label.strip() or not mount.strip():
+        raise ValueError("label and mount are required")
+    share = {"label": label.strip(), "mount": mount.strip()}
+    if description.strip():
+        share["description"] = description.strip()
+    async with _get_client() as client:
+        resp = await client.rci([
+            {"cifs": {"share": share}},
+            {"system": {"configuration": {"save": {}}}},
+        ])
+        _raise_on_rci_errors(resp)
+    return {"added": True, **share}
+
+
+async def delete_share(label: str) -> dict:
+    """Delete SMB/CIFS share by label and save configuration."""
+    assert_writable()
+    if not label.strip():
+        raise ValueError("label is required")
+    shares = await list_shares()
+    match = next((item for item in shares if item.get("label") == label.strip()), None)
+    if not match:
+        raise ValueError(f"Share not found: {label}")
+    async with _get_client() as client:
+        resp = await client.rci([
+            {"cifs": {"share": {
+                "label": match["label"],
+                "mount": match["mount"],
+                "no": True,
+            }}},
+            {"system": {"configuration": {"save": {}}}},
+        ])
+        _raise_on_rci_errors(resp)
+    return {"deleted": True, "label": match["label"], "mount": match["mount"]}
+
+
+async def unmount_usb(device: str) -> dict:
+    """Safely eject USB/media device (system eject). Refuses non-ejectable drives."""
+    assert_writable()
+    if not device.strip():
+        raise ValueError("device id is required (from list_usb_storage)")
+    devices = await list_usb_storage()
+    match = next((item for item in devices if item.get("id") == device.strip()), None)
+    if not match:
+        raise ValueError(f"Media device not found: {device}")
+    if match.get("ejectable") is False:
+        raise ValueError(f"Device is not ejectable: {device}")
+    async with _get_client() as client:
+        resp = await client.rci({"system": {"eject": {"name": device.strip()}}})
+        _raise_on_rci_errors(resp)
+    return {"ejected": True, "device": device.strip()}
+
+
 def register(mcp) -> None:
     mcp.tool()(list_usb_storage)
     mcp.tool()(list_shares)
     mcp.tool()(list_printers)
+    mcp.tool()(set_share)
+    mcp.tool()(delete_share)
+    mcp.tool()(unmount_usb)
