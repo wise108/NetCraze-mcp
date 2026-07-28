@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP
 from .client import _sanitize_error
 from .config import configure
 from .tools import register_tools
+from .tools.components import get_firmware_info, list_components
 from .tools.dns_routes import (
     add_dns_route,
     add_domains,
@@ -30,6 +31,7 @@ from .tools.network import (
 )
 from .tools.static_hosts import add_static_host, delete_static_host, list_static_hosts
 from .tools.static_routes import add_static_route, delete_static_route, list_static_routes
+from .tools.storage import list_printers, list_shares, list_usb_storage
 from .tools.system import get_system_info, reboot
 
 mcp = FastMCP("netcraze")

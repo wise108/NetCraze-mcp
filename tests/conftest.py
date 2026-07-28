@@ -4,10 +4,12 @@ import pytest
 from unittest.mock import AsyncMock
 
 import netcraze_mcp.config as config
+import netcraze_mcp.tools.components as components_tools
 import netcraze_mcp.tools.dns_routes as dns_routes_tools
 import netcraze_mcp.tools.network as network_tools
 import netcraze_mcp.tools.static_hosts as static_hosts_tools
 import netcraze_mcp.tools.static_routes as static_routes_tools
+import netcraze_mcp.tools.storage as storage_tools
 import netcraze_mcp.tools.system as system_tools
 
 
@@ -40,10 +42,12 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
     getter = lambda: client
     for module in (
         system_tools,
+        components_tools,
         network_tools,
         dns_routes_tools,
         static_hosts_tools,
         static_routes_tools,
+        storage_tools,
     ):
         monkeypatch.setattr(module, "_get_client", getter)
 

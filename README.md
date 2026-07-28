@@ -22,6 +22,16 @@ MCP-сервер для роутеров **NetCraze** — управление �
 | `add_static_route` | Добавить `ip route` (CIDR + gateway + interface) и save |
 | `delete_static_route` | Удалить по destination CIDR или index и save |
 
+### Компоненты, USB/хранилище, шары
+
+| Инструмент | Описание |
+|---|---|
+| `list_components` | NDMS-компоненты (installed/available), фильтр `group` / `installed_only` |
+| `get_firmware_info` | Версия прошивки, sandbox/channel, список установленных компонентов |
+| `list_usb_storage` | Накопители и разделы из `show media` |
+| `list_shares` | SMB/CIFS-шары из `show cifs` |
+| `list_printers` | Принтеры из `show printers` |
+
 ### Система, сеть, DNS-маршрутизация (upstream)
 
 `get_system_info`, `reboot`, `get_interfaces`, `get_interface`, `get_connected_clients`, `get_wifi_associations`, `get_speed`, `get_routes`, `get_wan_status`, `get_wan_speed`, `get_domain_lists`, `get_domain_list`, `create_domain_list`, `delete_domain_list`, `set_domain_list`, `add_domains`, `remove_domains`, `get_dns_routes`, `add_dns_route`, `delete_dns_route`, `set_interface_state`
@@ -116,6 +126,8 @@ netcraze_mcp/
     dns_routes.py    # domain lists, DNS routing
     static_hosts.py  # list/add/delete static hosts
     static_routes.py # list/add/delete static IP routes
+    components.py    # list_components, get_firmware_info
+    storage.py       # list_usb_storage, list_shares, list_printers
 tests/
   test_tools.py
 ```

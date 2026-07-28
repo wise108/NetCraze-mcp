@@ -4,6 +4,7 @@ import asyncio
 import pytest
 from netcraze_mcp.client import _sanitize_error
 from netcraze_mcp.config import configure
+from netcraze_mcp.tools.components import get_firmware_info, list_components
 from netcraze_mcp.tools.dns_routes import (
     add_dns_route,
     add_domains,
@@ -37,6 +38,7 @@ from netcraze_mcp.tools.static_routes import (
     delete_static_route,
     list_static_routes,
 )
+from netcraze_mcp.tools.storage import list_printers, list_shares, list_usb_storage
 from netcraze_mcp.tools.system import get_system_info, reboot
 
 
@@ -64,6 +66,108 @@ async def test_get_system_info_omits_none_fields(mock_client):
     assert "firmware" not in result
     assert "uptime" not in result
     assert result["model"] == "KN-1010"
+
+
+# ─── components / firmware / storage ──────────────────────────────────────────
+
+async def test_list_components_marks_installed_and_filters(mock_client):
+    mock_client.rci_get.return_value = {
+        "ndw": {"components": "usb,storage,tsmb"},
+    }
+    mock_client.rci.return_value = {
+        "components": {"list": {"component": {
+            "usb": {"group": "Base system", "description": {"RU": "USB"}, "version": "1"},
+            "ftp": {"group": "Storage", "description": {"EN": "FTP"}, "version": "1", "size": "100"},
+            "wireguard": {"group": "Networking", "description": {"RU": "WG"}},
+        }}}
+    }
+    all_components = await list_components()
+    assert [item["name"] for item in all_components] == ["usb", "ftp", "wireguard"]
+    assert all_components[0]["installed"] is True
+    assert all_components[1]["installed"] is False
+
+    storage_only = await list_components(group="Storage")
+    assert [item["name"] for item in storage_only] == ["ftp"]
+
+    installed_only = await list_components(installed_only=True)
+    assert [item["name"] for item in installed_only] == ["usb"]
+
+
+async def test_get_firmware_info(mock_client):
+    mock_client.rci_get.side_effect = [
+        {
+            "model": "Ultra (NC-1812)",
+            "release": "5.01.C.1.0-0",
+            "title": "5.1.1",
+            "arch": "aarch64",
+            "sandbox": "stable",
+            "manufacturer": "Netcraze Ltd.",
+            "ndw": {"components": "usb,storage"},
+        },
+        {"auto-update": {"disable": False, "channel": "stable"}},
+    ]
+    result = await get_firmware_info()
+    assert result["firmware"] == "5.01.C.1.0-0"
+    assert result["update_channel"] == "stable"
+    assert result["auto_update"] is True
+    assert result["components_installed"] == 2
+    assert result["components"] == ["usb", "storage"]
+
+
+async def test_list_usb_storage(mock_client):
+    mock_client.rci_get.return_value = {
+        "FlashStorage": {
+            "bus": "mtd",
+            "state": "ACTIVE",
+            "manufacturer": "Netcraze",
+            "product": "NC-1812",
+            "size": "117964800",
+            "removable": False,
+            "partition": {
+                "Partition1": {
+                    "id": "Partition1",
+                    "label": "Storage",
+                    "fstype": "ubifs",
+                    "state": "MOUNTED",
+                    "total": "102989824",
+                    "free": "102965248",
+                }
+            },
+        }
+    }
+    result = await list_usb_storage()
+    assert len(result) == 1
+    assert result[0]["id"] == "FlashStorage"
+    assert result[0]["partitions"][0]["fstype"] == "ubifs"
+    assert result[0]["partitions"][0]["free_bytes"] == 102965248
+
+
+async def test_list_shares(mock_client):
+    mock_client.rci_get.return_value = {
+        "enabled": False,
+        "automount": True,
+        "permissive": True,
+        "share": [{
+            "mount": "24A48978A4894D6C:",
+            "label": "Seagate Backup Plus Drive",
+            "description": "",
+            "active": False,
+        }],
+    }
+    result = await list_shares()
+    assert result == [{
+        "label": "Seagate Backup Plus Drive",
+        "mount": "24A48978A4894D6C:",
+        "active": False,
+        "enabled": False,
+        "automount": True,
+        "permissive": True,
+    }]
+
+
+async def test_list_printers_empty(mock_client):
+    mock_client.rci_get.return_value = {}
+    assert await list_printers() == []
 
 
 # ─── get_interfaces ───────────────────────────────────────────────────────────
