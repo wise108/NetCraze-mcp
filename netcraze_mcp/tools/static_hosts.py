@@ -68,6 +68,28 @@ def _normalize_static_entries(data) -> list[dict]:
     return result
 
 
+def _raise_on_rci_errors(data) -> None:
+    """RCI returns HTTP 200 even on command errors — fail if status=error."""
+    errors: list[str] = []
+
+    def walk(value) -> None:
+        if isinstance(value, dict):
+            status = value.get("status")
+            if isinstance(status, list):
+                for item in status:
+                    if isinstance(item, dict) and item.get("status") == "error":
+                        errors.append(str(item.get("message") or item))
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(data)
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 async def list_static_hosts(sort_by: str = "", order: str = "asc") -> list[dict]:
     """List static DNS hosts from show dns-proxy, filtered by private IP ranges."""
     if sort_by and sort_by not in ("name", "ip"):
@@ -95,10 +117,12 @@ async def add_static_host(host: str, ip: str) -> dict:
     if not _is_private_ip(ip):
         raise ValueError("Only private IPv4 addresses are allowed.")
     async with _get_client() as client:
-        await client.rci([
-            {"ip": {"host": {"name": host, "address": ip}}},
+        # NetCraze RCI expects domain+address (name+address → silent "no input")
+        resp = await client.rci([
+            {"ip": {"host": {"domain": host, "address": ip}}},
             {"system": {"configuration": {"save": {}}}},
         ])
+        _raise_on_rci_errors(resp)
     return {"added": True, "host": host, "ip": ip}
 
 
@@ -110,10 +134,11 @@ async def delete_static_host(host: str) -> dict:
     if not ip:
         raise ValueError(f"Static host not found: {host}")
     async with _get_client() as client:
-        await client.rci([
-            {"ip": {"host": {"name": host, "address": ip, "no": True}}},
+        resp = await client.rci([
+            {"ip": {"host": {"domain": host, "address": ip, "no": True}}},
             {"system": {"configuration": {"save": {}}}},
         ])
+        _raise_on_rci_errors(resp)
     return {"deleted": True, "host": host, "ip": ip}
 
 

@@ -423,9 +423,17 @@ async def test_add_static_host_sends_batch(mock_client):
     result = await add_static_host("router.home", "192.168.0.1")
     assert result["added"] is True
     mock_client.rci.assert_called_once_with([
-        {"ip": {"host": {"name": "router.home", "address": "192.168.0.1"}}},
+        {"ip": {"host": {"domain": "router.home", "address": "192.168.0.1"}}},
         {"system": {"configuration": {"save": {}}}},
     ])
+
+
+async def test_add_static_host_raises_on_rci_error(mock_client):
+    mock_client.rci.return_value = [{
+        "ip": {"host": {"status": [{"status": "error", "message": "no input [http/rci]."}]}}
+    }]
+    with pytest.raises(RuntimeError, match="no input"):
+        await add_static_host("router.home", "192.168.0.1")
 
 
 async def test_delete_static_host_by_name(mock_client):
@@ -433,7 +441,7 @@ async def test_delete_static_host_by_name(mock_client):
     result = await delete_static_host("router.home")
     assert result["deleted"] is True
     mock_client.rci.assert_called_once_with([
-        {"ip": {"host": {"name": "router.home", "address": "192.168.0.1", "no": True}}},
+        {"ip": {"host": {"domain": "router.home", "address": "192.168.0.1", "no": True}}},
         {"system": {"configuration": {"save": {}}}},
     ])
 
