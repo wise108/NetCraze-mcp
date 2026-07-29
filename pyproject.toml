@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "netcraze-mcp"
-version = "0.6.1"
+version = "0.6.2"
 description = "MCP server for NetCraze routers — manage interfaces, clients, routes and system via Cursor"
 readme = "README.md"
 license = { text = "MIT" }

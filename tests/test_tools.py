@@ -1,9 +1,11 @@
 """Tests for netcraze-mcp tools."""
 
-import asyncio
+import httpx
 import pytest
+
 from netcraze_mcp.client import _sanitize_error
 from netcraze_mcp.config import configure
+from netcraze_mcp.tools.backup import download_system_file, export_backup
 from netcraze_mcp.tools.components import (
     get_firmware_info,
     install_component,
@@ -78,6 +80,81 @@ async def test_get_system_info_omits_none_fields(mock_client):
     assert "firmware" not in result
     assert "uptime" not in result
     assert result["model"] == "KN-1010"
+
+
+# ─── backup / export ──────────────────────────────────────────────────────────
+
+async def test_download_system_file_startup_config_via_ci(mock_client):
+    mock_client.ci_get_bytes.return_value = (
+        b"! $$$ Model: Netcraze Ultra\r\n! $$$ Version: 2.06.1\r\n\r\nsystem\r\n    set net.ipv4.ip_forward 1\r\n"
+    )
+    result = await download_system_file(file_name="startup-config", include_text=True)
+    assert result["name"] == "startup-config"
+    assert result["filename"] == "startup-config.txt"
+    assert "ip_forward" in result["text"]
+    assert result["metadata"]["model"] == "Netcraze Ultra"
+    mock_client.ci_get_bytes.assert_called_once_with("startup-config.txt")
+
+
+async def test_download_system_file_startup_config_fallback_parse(mock_client):
+    request = httpx.Request("GET", "http://router/ci/startup-config.txt")
+    mock_client.ci_get_bytes.side_effect = httpx.HTTPStatusError(
+        "missing", request=request, response=httpx.Response(404, request=request),
+    )
+    mock_client.rci.return_value = {
+        "parse": {"message": ["! $$$ Model: Netcraze Ultra", "", "interface GigabitEthernet0"]},
+    }
+    result = await download_system_file(file_name="startup-config", include_text=True)
+    assert result["text"].startswith("! $$$ Model: Netcraze Ultra")
+    assert result["used_parse_fallback"] is True
+    mock_client.rci.assert_called_once_with({"parse": "more startup-config"})
+
+
+async def test_download_system_file_firmware_metadata_only(mock_client):
+    mock_client.rci_get.return_value = {
+        "model": "Ultra (NC-1812)",
+        "release": "5.01.C.1.0-0",
+        "title": "5.1.1",
+    }
+    mock_client.ci_get_bytes.return_value = b"FIRMWARE"
+    result = await download_system_file(file_name="firmware")
+    assert result["name"] == "firmware"
+    assert result["size_bytes"] == 8
+    assert result["sha256"] == "407d47dc1f3fb482d08a63269de7eaf19e56590672c78c9bc1bbcc4bb110ba19"
+    assert result["source"] == "installed"
+    assert "content_base64" not in result
+
+
+async def test_download_system_file_firmware_save_path(mock_client, tmp_path):
+    mock_client.rci_get.return_value = {"model": "Ultra", "release": "5.01.C.1.0-0", "title": "5.1.1"}
+    mock_client.ci_get_bytes.return_value = b"FIRMWARE"
+    target = tmp_path / "fw.bin"
+    result = await download_system_file(file_name="firmware", save_path=str(target))
+    assert target.read_bytes() == b"FIRMWARE"
+    assert result["saved_to"] == str(target)
+
+
+async def test_download_system_file_rejects_unknown_file(mock_client):
+    with pytest.raises(ValueError, match="Unsupported system file"):
+        await download_system_file(file_name="unknown-file")
+
+
+async def test_export_backup(mock_client):
+    config_text = b"! $$$ Model: Netcraze Ultra\r\n\r\nsystem\r\n"
+    mock_client.rci_get.return_value = {
+        "model": "Ultra (NC-1812)",
+        "release": "5.01.C.1.0-0",
+        "title": "5.1.1",
+        "arch": "aarch64",
+    }
+    mock_client.ci_get_bytes.side_effect = [config_text, b"FW"]
+    result = await export_backup(files=["startup-config", "firmware"], include_text=True)
+    assert result["model"] == "Ultra (NC-1812)"
+    assert result["files"][0]["name"] == "startup-config"
+    assert result["files"][0]["text"].startswith("! $$$ Model:")
+    assert result["files"][1]["name"] == "firmware"
+    assert result["files"][1]["size_bytes"] == 2
+    assert "timestamp" in result
 
 
 # ─── components / firmware / storage ──────────────────────────────────────────

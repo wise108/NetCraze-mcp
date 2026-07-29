@@ -1,10 +1,11 @@
 """Tool registration."""
 
-from . import components, dns_routes, network, static_hosts, static_routes, storage, system
+from . import backup, components, dns_routes, network, static_hosts, static_routes, storage, system
 
 
 def register_tools(mcp) -> None:
     system.register(mcp)
+    backup.register(mcp)
     components.register(mcp)
     network.register(mcp)
     dns_routes.register(mcp)

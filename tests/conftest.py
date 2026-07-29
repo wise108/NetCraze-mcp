@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import AsyncMock
 
 import netcraze_mcp.config as config
+import netcraze_mcp.tools.backup as backup_tools
 import netcraze_mcp.tools.components as components_tools
 import netcraze_mcp.tools.dns_routes as dns_routes_tools
 import netcraze_mcp.tools.network as network_tools
@@ -30,6 +31,7 @@ class MockNetCrazeClient:
     def __init__(self) -> None:
         self.rci = AsyncMock(return_value={})
         self.rci_get = AsyncMock(return_value={})
+        self.ci_get_bytes = AsyncMock(return_value=b"")
 
     async def __aenter__(self):
         return self
@@ -42,6 +44,7 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
     getter = lambda: client
     for module in (
         system_tools,
+        backup_tools,
         components_tools,
         network_tools,
         dns_routes_tools,

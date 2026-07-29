@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP
 from .client import _sanitize_error
 from .config import configure
 from .tools import register_tools
+from .tools.backup import download_system_file, export_backup
 from .tools.components import (
     get_firmware_info,
     install_component,

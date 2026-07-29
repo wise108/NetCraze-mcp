@@ -59,6 +59,13 @@ class NetCrazeClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def ci_get_bytes(self, path: str) -> bytes:
+        """Download binary from /ci/… (startup-config.txt, firmware, …)."""
+        assert self._http is not None
+        resp = await self._http.get(f"/ci/{path.lstrip('/')}")
+        resp.raise_for_status()
+        return resp.content
+
 
 def _get_client() -> NetCrazeClient:
     host = os.environ.get("NETCRAZE_HOST", "")
