@@ -66,6 +66,13 @@ class NetCrazeClient:
         resp.raise_for_status()
         return resp.content
 
+    async def rci_post(self, path: str, payload: dict | list) -> Any:
+        """POST JSON to /rci/<path> (e.g. interface/wireguard/import)."""
+        assert self._http is not None
+        resp = await self._http.post(f"/rci/{path.lstrip('/')}", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
 
 def _get_client() -> NetCrazeClient:
     host = os.environ.get("NETCRAZE_HOST", "")
@@ -85,11 +92,13 @@ def _get_client() -> NetCrazeClient:
 
 def _sanitize_error(e: Exception) -> str:
     msg = str(e)
-    return re.sub(
-        r"(?i)(password|token|pass)[=:\s]+\S+",
+    msg = re.sub(
+        r"(?i)(password|token|pass|private[_-]?key|preshared[_-]?key)[=:\s]+\S+",
         r"\1=<redacted>",
         msg,
     )
+    # WireGuard base64 keys (32 bytes → 44 chars with padding)
+    return re.sub(r"[A-Za-z0-9+/]{42,44}=", "***", msg)
 
 
 def _raise_on_rci_errors(data: Any) -> None:

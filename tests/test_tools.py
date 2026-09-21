@@ -54,6 +54,13 @@ from netcraze_mcp.tools.storage import (
     unmount_usb,
 )
 from netcraze_mcp.tools.system import get_system_info, reboot
+from netcraze_mcp.tools.wireguard import (
+    add_wireguard_from_conf,
+    delete_wireguard,
+    get_wireguard,
+    list_wireguard,
+    set_wireguard_state,
+)
 
 
 # ─── get_system_info ──────────────────────────────────────────────────────────
@@ -155,6 +162,139 @@ async def test_export_backup(mock_client):
     assert result["files"][1]["name"] == "firmware"
     assert result["files"][1]["size_bytes"] == 2
     assert "timestamp" in result
+
+
+# ─── wireguard ────────────────────────────────────────────────────────────────
+
+_WG_CONF = """[Interface]
+Address = 10.13.14.2/32
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEE=
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBEE=
+PresharedKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCEE=
+Endpoint = 45.89.63.73:51821
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+"""
+
+
+async def test_list_wireguard(mock_client):
+    mock_client.rci_get.return_value = {
+        "Wireguard2": {
+            "id": "Wireguard2",
+            "type": "Wireguard",
+            "description": "My VPN",
+            "state": "up",
+            "link": "up",
+            "address": "10.13.13.2",
+            "wireguard": {
+                "peer": [{
+                    "remote-endpoint-address": "45.89.63.73",
+                    "remote-port": 51820,
+                }]
+            },
+        },
+        "Bridge0": {"id": "Bridge0", "type": "Bridge"},
+    }
+    result = await list_wireguard()
+    assert len(result) == 1
+    assert result[0]["id"] == "Wireguard2"
+    assert result[0]["endpoint"] == "45.89.63.73:51820"
+
+
+async def test_get_wireguard_hides_secrets(mock_client):
+    mock_client.rci_get.return_value = {
+        "id": "Wireguard2",
+        "type": "Wireguard",
+        "description": "My VPN",
+        "state": "up",
+        "link": "up",
+        "address": "10.13.13.2",
+        "wireguard": {
+            "public-key": "PUBKEYPUBKEYPUBKEYPUBKEYPUBKEYPUBKEYPUB=",
+            "peer": [{
+                "public-key": "PEERPEERPEERPEERPEERPEERPEERPEERPEERPE=",
+                "remote-endpoint-address": "45.89.63.73",
+                "remote-port": 51820,
+                "online": True,
+            }],
+        },
+    }
+    result = await get_wireguard("Wireguard2")
+    assert result["id"] == "Wireguard2"
+    assert result["public_key"].startswith("PUBKEY")
+    assert "private" not in str(result).lower() or "private_key" not in result
+    dumped = str(result)
+    assert "PresharedKey" not in dumped
+    assert "PrivateKey" not in dumped
+
+
+async def test_add_wireguard_from_conf_import(mock_client):
+    mock_client.rci_post.return_value = {
+        "created": "Wireguard3",
+        "status": [{"status": "message", "message": "imported"}],
+    }
+    mock_client.rci.return_value = {}
+    mock_client.rci_get.return_value = {
+        "id": "Wireguard3",
+        "type": "Wireguard",
+        "description": "Cloudflare WARP",
+        "state": "up",
+        "link": "up",
+        "address": "10.13.14.2",
+        "wireguard": {
+            "peer": [{
+                "remote-endpoint-address": "45.89.63.73",
+                "remote-port": 51821,
+            }]
+        },
+    }
+    result = await add_wireguard_from_conf(
+        conf=_WG_CONF,
+        description="Cloudflare WARP",
+        enabled=True,
+    )
+    assert result["id"] == "Wireguard3"
+    assert result["address"] == "10.13.14.2"
+    assert result["enabled"] is True
+    assert "AAAAAAAAAAAAAAAA" not in str(result)
+    assert "CCCCCCCCCCCCCCCC" not in str(result)
+    mock_client.rci_post.assert_called_once()
+    assert mock_client.rci_post.call_args.args[0] == "interface/wireguard/import"
+    # last batch includes save
+    last = mock_client.rci.call_args_list[-1].args[0]
+    assert {"system": {"configuration": {"save": {}}}} in last
+
+
+async def test_add_wireguard_from_conf_safe_mode(mock_client):
+    configure(safe_mode=True)
+    with pytest.raises(PermissionError):
+        await add_wireguard_from_conf(conf=_WG_CONF)
+
+
+async def test_set_wireguard_state(mock_client):
+    mock_client.rci_get.return_value = {
+        "id": "Wireguard3",
+        "type": "Wireguard",
+        "state": "down",
+        "link": "down",
+        "address": "10.13.14.2",
+    }
+    mock_client.rci.return_value = {}
+    result = await set_wireguard_state("Wireguard3", enabled=False)
+    assert result["id"] == "Wireguard3"
+    assert result["enabled"] is False
+    assert mock_client.rci.call_args.args[0] == [
+        {"interface": {"Wireguard3": {"down": True}}},
+        {"system": {"configuration": {"save": {}}}},
+    ]
+
+
+async def test_delete_wireguard(mock_client):
+    mock_client.rci_get.return_value = {"id": "Wireguard3", "type": "Wireguard"}
+    mock_client.rci.return_value = {}
+    result = await delete_wireguard("Wireguard3")
+    assert result == {"deleted": True, "id": "Wireguard3"}
 
 
 # ─── components / firmware / storage ──────────────────────────────────────────

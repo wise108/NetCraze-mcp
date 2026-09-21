@@ -12,6 +12,7 @@ import netcraze_mcp.tools.static_hosts as static_hosts_tools
 import netcraze_mcp.tools.static_routes as static_routes_tools
 import netcraze_mcp.tools.storage as storage_tools
 import netcraze_mcp.tools.system as system_tools
+import netcraze_mcp.tools.wireguard as wireguard_tools
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +33,7 @@ class MockNetCrazeClient:
         self.rci = AsyncMock(return_value={})
         self.rci_get = AsyncMock(return_value={})
         self.ci_get_bytes = AsyncMock(return_value=b"")
+        self.rci_post = AsyncMock(return_value={})
 
     async def __aenter__(self):
         return self
@@ -51,6 +53,7 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
         static_hosts_tools,
         static_routes_tools,
         storage_tools,
+        wireguard_tools,
     ):
         monkeypatch.setattr(module, "_get_client", getter)
 

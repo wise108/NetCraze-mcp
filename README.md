@@ -47,6 +47,31 @@ MCP-сервер для роутеров **NetCraze** — управление �
 
 > Бинарник прошивки ~20–25 MB. По умолчанию в ответе только sha256/size; для файла укажите `save_path`. Параметр `sandbox` добавляет метаданные канала обновлений, но .bin — только текущая установленная прошивка.
 
+### WireGuard
+
+| Инструмент | Описание |
+|---|---|
+| `list_wireguard` | Список `WireguardN`: id, description, state, link, address, endpoint |
+| `get_wireguard` | Детали одного интерфейса (без PrivateKey/PresharedKey) |
+| `add_wireguard_from_conf` | Импорт из `.conf` (`conf` текст или `path` к `.conf`); save; опционально `interface_id`, `enabled`, `description` |
+| `set_wireguard_state` | up/down без удаления + save |
+| `delete_wireguard` | Удалить интерфейс + save |
+
+Пример:
+
+```text
+add_wireguard_from_conf(
+  conf="<содержимое peer_xxx.conf>",
+  description="Cloudflare WARP",
+  enabled=true
+)
+→ { "id": "Wireguard3", "description": "Cloudflare WARP", "address": "10.13.14.2", ... }
+
+add_dns_route(list_name="Gemini", interface="Wireguard3", auto=true, enabled=true)
+```
+
+> PrivateKey/PresharedKey никогда не возвращаются и маскируются в ошибках. Импорт идёт через `/rci/interface/wireguard/import` (как UI «из файла»).
+
 ### Система, сеть, DNS-маршрутизация (upstream)
 
 `get_system_info`, `reboot`, `get_interfaces`, `get_interface`, `get_connected_clients`, `get_wifi_associations`, `get_speed`, `get_routes`, `get_wan_status`, `get_wan_speed`, `get_domain_lists`, `get_domain_list`, `create_domain_list`, `delete_domain_list`, `set_domain_list`, `add_domains`, `remove_domains`, `get_dns_routes`, `add_dns_route`, `delete_dns_route`, `set_interface_state`
@@ -144,6 +169,7 @@ netcraze_mcp/
     components.py    # list_components, get_firmware_info
     storage.py       # list_usb_storage, list_shares, list_printers
     backup.py        # download_system_file, export_backup
+    wireguard.py     # list/get/add_from_conf/set_state/delete WireGuard
 tests/
   test_tools.py
 ```

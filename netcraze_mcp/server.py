@@ -46,6 +46,13 @@ from .tools.storage import (
     unmount_usb,
 )
 from .tools.system import get_system_info, reboot
+from .tools.wireguard import (
+    add_wireguard_from_conf,
+    delete_wireguard,
+    get_wireguard,
+    list_wireguard,
+    set_wireguard_state,
+)
 
 mcp = FastMCP("netcraze")
 register_tools(mcp)
