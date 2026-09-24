@@ -72,6 +72,20 @@ add_dns_route(list_name="Gemini", interface="Wireguard3", auto=true, enabled=tru
 
 > PrivateKey/PresharedKey никогда не возвращаются и маскируются в ошибках. Импорт идёт через `/rci/interface/wireguard/import` (как UI «из файла»).
 
+### IPsec site-to-site (read-only)
+
+| Инструмент | Описание | RCI на NDMS 5.01 |
+|---|---|---|
+| `list_ipsec` / `list_ipsec_connections` | Список S2S: id, enabled, connected/state, remote gateway, IKE version | `GET show/sc/crypto/ipsec/site-to-site` + `GET show/crypto/map` |
+| `get_ipsec` | Детали (ID, subnets, IKE/ESP, DPD, nailed-up, autoconnect, Phase1/2); PSK → только `has_psk` | те же |
+| `list_ipsec_proposals` | IKE/ESP/DH алгоритмы (aes-cbc-256, sha256, DH14/modp2048…) | UI static (live catalog на 5.01 нет) |
+| `show_ipsec_sa` | SA: legacy `show/crypto/ipsec/sa` (часто 404) → fallback из `show/crypto/map` | см. ответ `rci_paths` |
+| `show_ipsec` | Dump ipsec + site-to-site + crypto_map без секретов | `show/ipsec`, site-to-site, map |
+| `show_crypto` | Dump crypto/sc crypto/ike без секретов | `show/crypto`, `show/sc/crypto`, `show/crypto/map` |
+
+> WRITE (`create_ipsec_s2s` / `set_ipsec_state` / `delete_ipsec`) — отдельно, пока не реализовано.  
+> На NDMS 5.01 путь `show/crypto/ipsec/sa` отсутствует (404); статус туннелей — в `show/crypto/map`.
+
 ### Система, сеть, DNS-маршрутизация (upstream)
 
 `get_system_info`, `reboot`, `get_interfaces`, `get_interface`, `get_connected_clients`, `get_wifi_associations`, `get_speed`, `get_routes`, `get_wan_status`, `get_wan_speed`, `get_domain_lists`, `get_domain_list`, `create_domain_list`, `delete_domain_list`, `set_domain_list`, `add_domains`, `remove_domains`, `get_dns_routes`, `add_dns_route`, `delete_dns_route`, `set_interface_state`
@@ -170,6 +184,7 @@ netcraze_mcp/
     storage.py       # list_usb_storage, list_shares, list_printers
     backup.py        # download_system_file, export_backup
     wireguard.py     # list/get/add_from_conf/set_state/delete WireGuard
+    ipsec.py         # list/get/proposals/show_* IPsec S2S (read-only)
 tests/
   test_tools.py
 ```

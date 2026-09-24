@@ -1,6 +1,6 @@
 """Tool registration."""
 
-from . import backup, components, dns_routes, network, static_hosts, static_routes, storage, system, wireguard
+from . import backup, components, dns_routes, ipsec, network, static_hosts, static_routes, storage, system, wireguard
 
 
 def register_tools(mcp) -> None:
@@ -13,3 +13,4 @@ def register_tools(mcp) -> None:
     static_routes.register(mcp)
     storage.register(mcp)
     wireguard.register(mcp)
+    ipsec.register(mcp)

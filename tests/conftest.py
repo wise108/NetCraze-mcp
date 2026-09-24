@@ -13,6 +13,7 @@ import netcraze_mcp.tools.static_routes as static_routes_tools
 import netcraze_mcp.tools.storage as storage_tools
 import netcraze_mcp.tools.system as system_tools
 import netcraze_mcp.tools.wireguard as wireguard_tools
+import netcraze_mcp.tools.ipsec as ipsec_tools
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +55,7 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
         static_routes_tools,
         storage_tools,
         wireguard_tools,
+        ipsec_tools,
     ):
         monkeypatch.setattr(module, "_get_client", getter)
 

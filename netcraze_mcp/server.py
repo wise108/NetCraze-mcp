@@ -53,6 +53,15 @@ from .tools.wireguard import (
     list_wireguard,
     set_wireguard_state,
 )
+from .tools.ipsec import (
+    get_ipsec,
+    list_ipsec,
+    list_ipsec_connections,
+    list_ipsec_proposals,
+    show_crypto,
+    show_ipsec,
+    show_ipsec_sa,
+)
 
 mcp = FastMCP("netcraze")
 register_tools(mcp)

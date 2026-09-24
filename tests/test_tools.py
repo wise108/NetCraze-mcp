@@ -61,6 +61,14 @@ from netcraze_mcp.tools.wireguard import (
     list_wireguard,
     set_wireguard_state,
 )
+from netcraze_mcp.tools.ipsec import (
+    get_ipsec,
+    list_ipsec,
+    list_ipsec_proposals,
+    show_crypto,
+    show_ipsec,
+    show_ipsec_sa,
+)
 
 
 # ─── get_system_info ──────────────────────────────────────────────────────────
@@ -295,6 +303,135 @@ async def test_delete_wireguard(mock_client):
     mock_client.rci.return_value = {}
     result = await delete_wireguard("Wireguard3")
     assert result == {"deleted": True, "id": "Wireguard3"}
+
+
+# ─── ipsec (read-only) ────────────────────────────────────────────────────────
+
+async def test_list_ipsec_empty(mock_client):
+    mock_client.rci_get.side_effect = [[], {}]
+    assert await list_ipsec() == []
+
+
+async def test_list_ipsec_summaries(mock_client):
+    mock_client.rci_get.side_effect = [
+        {
+            "office": {
+                "name": "office",
+                "peer": "203.0.113.1",
+                "ike-protocol": "ikev2",
+                "passive": False,
+                "ike-psk": "super-secret",
+            }
+        },
+        {
+            "office": {
+                "config": {"enabled": "yes"},
+                "status": {"state": "PHASE2_ESTABLISHED", "ike_state": "ESTABLISHED"},
+            }
+        },
+    ]
+    result = await list_ipsec()
+    assert len(result) == 1
+    assert result[0]["id"] == "office"
+    assert result[0]["connected"] is True
+    assert result[0]["ike_version"] == "ikev2"
+    assert result[0]["remote_gateway"] == "203.0.113.1"
+    assert "super-secret" not in str(result)
+
+
+async def test_get_ipsec_redacts_psk(mock_client):
+    mock_client.rci_get.side_effect = [
+        {
+            "office": {
+                "name": "office",
+                "peer": "203.0.113.1",
+                "ike-protocol": "ikev2",
+                "ike-psk": "super-secret",
+                "ike-local-id-type": "address",
+                "ike-local-id": "198.51.100.1",
+                "ike-remote-id-type": "address",
+                "ike-remote-id": "203.0.113.1",
+                "ipsec-local-networks": "192.168.1.0/24",
+                "ipsec-remote-networks": "10.0.0.0/8",
+                "ike-encryption": "aes-cbc-256",
+                "ike-integrity": "sha256",
+                "ike-dh": "14",
+                "ipsec-encryption": "esp-aes-256",
+                "ipsec-integrity": "esp-sha256-hmac",
+                "ipsec-dh": "14",
+                "dpd": True,
+                "nail-up": True,
+                "autoconnect": True,
+                "passive": False,
+            }
+        },
+        {
+            "office": {
+                "config": {"enabled": "yes"},
+                "status": {
+                    "state": "PHASE2_ESTABLISHED",
+                    "phase1": {"rekey_time": 1000},
+                    "phase2_sa_list": {"phase2_sa": [{"sa_state": "INSTALLED", "rekey_time": 500}]},
+                },
+            }
+        },
+    ]
+    result = await get_ipsec("office")
+    assert result["has_psk"] is True
+    assert result["local_subnets"] == ["192.168.1.0/24"]
+    assert result["ike_proposal"]["encryption"] == ["aes-cbc-256"]
+    assert "super-secret" not in str(result)
+    assert "<REDACTED>" not in str(result.get("ike_proposal"))
+
+
+async def test_get_ipsec_missing(mock_client):
+    mock_client.rci_get.side_effect = [[], {}]
+    with pytest.raises(ValueError, match="not found"):
+        await get_ipsec("missing")
+
+
+async def test_list_ipsec_proposals_contains_aes256_sha256_dh14():
+    result = await list_ipsec_proposals()
+    assert result["contains"]["aes256"] is True
+    assert result["contains"]["sha256"] is True
+    assert result["contains"]["modp2048_dh14"] is True
+    assert "aes-cbc-256" in result["ike"]["encryption"]
+    assert "sha256" in result["ike"]["integrity"]
+    assert "14" in result["ike"]["dh_groups"]
+    assert "esp-aes-256" in result["esp"]["encryption"]
+
+
+async def test_show_ipsec_sa_empty_fallback(mock_client):
+    mock_client.rci_get.side_effect = [
+        Exception("404 Not Found"),
+        {},
+    ]
+    result = await show_ipsec_sa()
+    assert result["legacy_sa_available"] is False
+    assert result["count"] == 0
+    assert result["established"] == 0
+    assert result["sa"] == []
+
+
+async def test_show_ipsec_and_crypto_redact(mock_client):
+    mock_client.rci_get.side_effect = [
+        {},  # show/ipsec
+        {"office": {"ike-psk": "secret", "peer": "1.2.3.4"}},  # connections
+        {"office": {"config": {"enabled": "yes"}}},  # status map
+    ]
+    dumped = await show_ipsec()
+    assert dumped["site_to_site"]["office"]["ike-psk"] == "<REDACTED>"
+    assert dumped["site_to_site"]["office"]["peer"] == "1.2.3.4"
+
+    mock_client.rci_get.side_effect = [
+        {"engine": {"engine": "software"}},
+        {"engine": {"engine": "software"}},
+        {},
+        {},
+        {"key": "should-redact-if-secret-field"},
+    ]
+    crypto = await show_crypto()
+    assert crypto["crypto"]["engine"]["engine"] == "software"
 
 
 # ─── components / firmware / storage ──────────────────────────────────────────
