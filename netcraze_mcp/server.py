@@ -63,13 +63,17 @@ from .tools.wireguard import (
     set_wireguard_state,
 )
 from .tools.ipsec import (
+    create_ipsec_s2s,
+    delete_ipsec,
     get_ipsec,
     list_ipsec,
     list_ipsec_connections,
     list_ipsec_proposals,
+    set_ipsec_state,
     show_crypto,
     show_ipsec,
     show_ipsec_sa,
+    update_ipsec_s2s,
 )
 
 mcp = FastMCP("netcraze")

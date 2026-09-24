@@ -434,6 +434,268 @@ async def test_show_ipsec_and_crypto_redact(mock_client):
     assert crypto["crypto"]["engine"]["engine"] == "software"
 
 
+# ─── ipsec WRITE (0.10.0) ─────────────────────────────────────────────────────
+
+from netcraze_mcp.tools.ipsec import (
+    _s2s_flat_payload,
+    create_ipsec_s2s,
+    delete_ipsec,
+    set_ipsec_state,
+    update_ipsec_s2s,
+)
+
+
+def test_s2s_flat_payload_never_nested_and_has_lifetimes():
+    payload = _s2s_flat_payload(
+        name="nc-office",
+        peer="45.89.63.73",
+        ike_psk="SuperSecretPskValue!!",
+        local_id="office-nc1812",
+        remote_id="weaselcloud-ipsec",
+        local_networks="192.168.1.0/24",
+        remote_networks=["1.1.1.1/32"],
+    )
+    assert payload["name"] == "nc-office"
+    assert payload["ike-lifetime"] == "86400"
+    assert payload["ipsec-lifetime"] == "28800"
+    assert payload["ipsec-remote-networks"] == "1.1.1.1/32"
+    assert all(not isinstance(v, dict) for v in payload.values())
+
+
+async def test_create_ipsec_s2s_order_enable_save(mock_client):
+    calls: list = []
+
+    async def rci(payload):
+        calls.append(("rci", payload))
+        return {"ok": True}
+
+    async def rci_get(path):
+        calls.append(("get", path))
+        cfg = {
+            "nc-office": {
+                "name": "nc-office",
+                "peer": "45.89.63.73",
+                "ike-protocol": "ikev2",
+                "ike-psk": "x",
+                "ike-local-id-type": "dn",
+                "ike-local-id": "office-nc1812",
+                "ike-remote-id-type": "dn",
+                "ike-remote-id": "weaselcloud-ipsec",
+                "ipsec-local-networks": "192.168.1.0/24",
+                "ipsec-remote-networks": "1.1.1.1/32",
+                "ike-aead": False,
+                "ike-encryption": "aes-cbc-256",
+                "ike-integrity": "sha256",
+                "ike-prf": "",
+                "ike-dh": "14",
+                "ike-lifetime": "86400",
+                "ipsec-aead": False,
+                "ipsec-encryption": "esp-aes-256",
+                "ipsec-integrity": "esp-sha256-hmac",
+                "ipsec-dh": "14",
+                "ipsec-lifetime": "28800",
+                "dpd": True,
+                "dpd-interval": "30",
+                "nail-up": True,
+                "autoconnect": True,
+                "passive": False,
+                "ike-mode": "main",
+                "ipsec-mode": "tunnel",
+            }
+        }
+        if "show/rc/" in path or path.endswith("site-to-site"):
+            return cfg
+        if path == "show/crypto/map":
+            return {
+                "crypto_map": {
+                    "nc-office": {"config": {"enabled": "yes"}, "status": {"state": "UNDEFINED"}}
+                }
+            }
+        return {}
+
+    mock_client.rci.side_effect = rci
+    mock_client.rci_get.side_effect = rci_get
+
+    result = await create_ipsec_s2s(
+        name="nc-office",
+        peer="45.89.63.73",
+        ike_psk="SuperSecretPskValue!!",
+        local_id="office-nc1812",
+        remote_id="weaselcloud-ipsec",
+        local_networks="192.168.1.0/24",
+        remote_networks="1.1.1.1/32",
+        confirm=True,
+    )
+    assert result["action"] in ("created", "updated")
+    assert result["saved"] is True
+    assert "SuperSecretPskValue" not in str(result)
+
+    rci_payloads = [p for kind, p in calls if kind == "rci"]
+    assert len(rci_payloads) >= 3
+    s2s = rci_payloads[0][0]["crypto"]["ipsec"]["site-to-site"]
+    assert s2s["name"] == "nc-office"
+    assert "ike-lifetime" in s2s and "ipsec-lifetime" in s2s
+    assert "enable" not in s2s
+    assert list(rci_payloads[0][0]["crypto"]["ipsec"].keys()) == ["site-to-site"]
+    assert rci_payloads[1] == {"parse": "crypto map nc-office enable"}
+    assert rci_payloads[2] == {"system": {"configuration": {"save": {}}}}
+
+
+async def test_set_ipsec_state_parse_only(mock_client):
+    calls = []
+
+    async def rci(payload):
+        calls.append(payload)
+        return {}
+
+    async def rci_get(path):
+        if "show/rc/" in path or path.endswith("site-to-site"):
+            return {"office": {"name": "office", "peer": "1.2.3.4"}}
+        if path == "show/crypto/map":
+            return {"crypto_map": {"office": {"config": {"enabled": "no"}, "status": {}}}}
+        return {}
+
+    mock_client.rci.side_effect = rci
+    mock_client.rci_get.side_effect = rci_get
+    await set_ipsec_state("office", enabled=False, confirm=True)
+    assert calls[0] == {"parse": "no crypto map office enable"}
+    assert calls[1] == {"system": {"configuration": {"save": {}}}}
+
+
+async def test_create_confirm_false_raises(mock_client):
+    with pytest.raises(ValueError, match="confirm=true"):
+        await create_ipsec_s2s(
+            name="x",
+            peer="1.1.1.1",
+            ike_psk="psk",
+            local_id="a",
+            remote_id="b",
+            local_networks="10.0.0.0/24",
+            remote_networks="1.1.1.1/32",
+            confirm=False,
+        )
+
+
+async def test_create_safe_mode_raises(mock_client, monkeypatch):
+    monkeypatch.setenv("NETCRAZE_SAFE_MODE", "true")
+    configure(safe_mode=None)
+    with pytest.raises(PermissionError, match="safe mode"):
+        await create_ipsec_s2s(
+            name="x",
+            peer="1.1.1.1",
+            ike_psk="psk",
+            local_id="a",
+            remote_id="b",
+            local_networks="10.0.0.0/24",
+            remote_networks="1.1.1.1/32",
+            confirm=True,
+        )
+
+
+async def test_delete_ipsec_flat_no(mock_client):
+    calls = []
+    state = {"present": True}
+
+    async def rci(payload):
+        calls.append(payload)
+        state["present"] = False
+        return {
+            "crypto": {
+                "ipsec": {
+                    "site-to-site": {
+                        "status": [{"status": "message", "message": "removed"}]
+                    }
+                }
+            }
+        }
+
+    async def rci_get(path):
+        if "show/rc/" in path:
+            return {"tmp": {"name": "tmp", "peer": "1.2.3.4"}} if state["present"] else {}
+        if path.endswith("site-to-site") or path == "show/crypto/map":
+            return {}
+        return {}
+
+    mock_client.rci.side_effect = rci
+    mock_client.rci_get.side_effect = rci_get
+    result = await delete_ipsec("tmp", confirm=True)
+    assert result["deleted"] is True
+    assert calls[0] == [{"crypto": {"ipsec": {"site-to-site": {"name": "tmp", "no": True}}}}]
+
+
+def test_no_partial_enable_json_path():
+    import inspect
+    import netcraze_mcp.tools.ipsec as mod
+
+    src = inspect.getsource(mod)
+    assert '{"name": name, "enable"' not in src
+    assert "payload[\"enable\"]" not in src
+    assert "'enable': enable" not in src
+    assert '"enable": enable' not in src
+
+
+async def test_update_keep_psk_does_not_leak(mock_client):
+    calls = []
+    peer = {"value": "1.2.3.4"}
+
+    async def rci(payload):
+        calls.append(payload)
+        if isinstance(payload, list) and payload and "crypto" in payload[0]:
+            s2s = payload[0]["crypto"]["ipsec"]["site-to-site"]
+            peer["value"] = s2s["peer"]
+        return {}
+
+    async def rci_get(path):
+        cfg = {
+            "office": {
+                "name": "office",
+                "peer": peer["value"],
+                "ike-protocol": "ikev2",
+                "ike-psk": "KeepMeSecretPSK=======",
+                "ike-local-id-type": "dn",
+                "ike-local-id": "local",
+                "ike-remote-id-type": "dn",
+                "ike-remote-id": "remote",
+                "ipsec-local-networks": "192.168.1.0/24",
+                "ipsec-remote-networks": "10.0.0.0/8",
+                "ike-encryption": "aes-cbc-256",
+                "ike-integrity": "sha256",
+                "ike-prf": "sha256",
+                "ike-dh": "14",
+                "ike-lifetime": "86400",
+                "ipsec-encryption": "esp-aes-256",
+                "ipsec-integrity": "esp-sha256-hmac",
+                "ipsec-dh": "14",
+                "ipsec-lifetime": "28800",
+                "dpd": True,
+                "dpd-interval": "30",
+                "nail-up": True,
+                "autoconnect": True,
+                "passive": False,
+                "ike-mode": "main",
+                "ipsec-mode": "tunnel",
+                "ike-aead": False,
+                "ipsec-aead": False,
+                "force-encaps": True,
+            }
+        }
+        if "show/rc/" in path or path.endswith("site-to-site"):
+            return cfg
+        if path == "show/crypto/map":
+            return {"crypto_map": {"office": {"config": {"enabled": "yes"}, "status": {}}}}
+        return {}
+
+    mock_client.rci.side_effect = rci
+    mock_client.rci_get.side_effect = rci_get
+    result = await update_ipsec_s2s(
+        name="office", peer="9.9.9.9", keep_psk=True, enable=None, confirm=True
+    )
+    assert "KeepMeSecretPSK" not in str(result)
+    s2s = calls[0][0]["crypto"]["ipsec"]["site-to-site"]
+    assert s2s["ike-psk"] == "KeepMeSecretPSK======="
+    assert s2s["peer"] == "9.9.9.9"
+
+
 # ─── components / firmware / storage ──────────────────────────────────────────
 
 async def test_list_components_marks_installed_and_filters(mock_client):

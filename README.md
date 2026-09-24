@@ -83,8 +83,50 @@ add_dns_route(list_name="Gemini", interface="Wireguard3", auto=true, enabled=tru
 | `show_ipsec` | Dump ipsec + site-to-site + crypto_map без секретов | `show/ipsec`, site-to-site, map |
 | `show_crypto` | Dump crypto/sc crypto/ike без секретов | `show/crypto`, `show/sc/crypto`, `show/crypto/map` |
 
-> WRITE (`create_ipsec_s2s` / `set_ipsec_state` / `delete_ipsec`) — отдельно, пока не реализовано.  
 > На NDMS 5.01 путь `show/crypto/ipsec/sa` отсутствует (404); статус туннелей — в `show/crypto/map`.
+
+### IPsec site-to-site WRITE (0.10.0)
+
+| Инструмент | Описание |
+|---|---|
+| `create_ipsec_s2s` | Создать/обновить S2S (idempotent по `name`); **confirm=true** обязателен |
+| `update_ipsec_s2s` | Full-replace RMW; `keep_psk=true` читает PSK из RC только в памяти |
+| `set_ipsec_state` | Только `parse crypto map … enable` / `no crypto map … enable` |
+| `delete_ipsec` | Flat `{name, no: true}` → «removed crypto map.» |
+
+Каноническая последовательность:
+
+```text
+1) POST /rci/  [{"crypto":{"ipsec":{"site-to-site":{ "name":"…", …все поля + lifetimes… }}}}]
+2) parse: crypto map <name> enable          # или: no crypto map <name> enable
+3) system.configuration.save
+```
+
+Пример (NC → strongSwan IKEv2 PSK):
+
+```text
+create_ipsec_s2s(
+  name="nc-office",
+  peer="45.89.63.73",
+  ike_psk="<PSK>",
+  local_id="office-nc1812",
+  remote_id="weaselcloud-ipsec",
+  local_networks="192.168.1.0/24",
+  remote_networks="1.1.1.1/32",
+  force_encaps=true,
+  enable=true,
+  save=true,
+  confirm=true
+)
+```
+
+**Known limitations (NDMS 5.01):**
+- Nested `site-to-site.{name}` → `not found` — только flat с полем `name`
+- Partial `{"name","enable":true}` в site-to-site JSON **сбрасывает** peer/autoconnect — запрещено в tools
+- `show/sc` до save устаревший; verify сначала `show/rc`
+- `ike-prf` может остаться `""` в RC; `force-encaps` может отсутствовать в RC после set (для double-NAT смотри `show/crypto/map`)
+- `crypto map X disable` не существует → используем `no crypto map X enable`
+- PSK никогда не возвращается (`has_psk` only); нужен `confirm=true` + writable (не safe-mode)
 
 ### Raw RCI + аудит (read-only, 0.9.0)
 
