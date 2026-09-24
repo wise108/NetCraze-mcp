@@ -527,28 +527,126 @@ def _runtime_from_map_entry(name: str, entry: dict | None, map_cfg: dict | None 
             phase2 = raw
         elif isinstance(raw, dict):
             phase2 = [raw]
+    # Always expose endpoints (missing → 0.0.0.0) so tools share identical fields.
+    local_ep = status.get("local-endpoint-address") or "0.0.0.0"
+    remote_ep = status.get("remote-endpoint-address") or "0.0.0.0"
+    out = {
+        "id": name,
+        "enabled": enabled,
+        "connected": connected,
+        "ui_status": ui_status,
+        "initiator": status.get("initiator"),
+        "ike_state": ike_state,
+        "state": phase_state,
+        "local_endpoint": local_ep,
+        "remote_endpoint": remote_ep,
+        "via": status.get("via") or None,
+        "remote_peer": config.get("remote_peer"),
+        "mode": config.get("mode"),
+        "profile": config.get("crypto_ipsec_profile_name"),
+        **map_flags,
+        "phase1": phase1,
+        "phase2_sa": phase2 or None,
+    }
     return _redact({
         key: value
-        for key, value in {
-            "id": name,
-            "enabled": enabled,
-            "connected": connected,
-            "ui_status": ui_status,
-            "initiator": status.get("initiator"),
-            "ike_state": ike_state,
-            "state": phase_state,
-            "local_endpoint": status.get("local-endpoint-address"),
-            "remote_endpoint": status.get("remote-endpoint-address"),
-            "via": status.get("via") or None,
-            "remote_peer": config.get("remote_peer"),
-            "mode": config.get("mode"),
-            "profile": config.get("crypto_ipsec_profile_name"),
-            **map_flags,
-            "phase1": phase1,
-            "phase2_sa": phase2 or None,
-        }.items()
+        for key, value in out.items()
         if value is not None and value != [] and value != {}
     })
+
+
+async def _fetch_runtime_context(client) -> dict[str, Any]:
+    """Single snapshot used by get_ipsec_runtime and diagnose_ipsec_bringup."""
+    statuses = _normalize_status_map(await client.rci_get(_RCI_PATHS["status_map"]))
+    map_rc: dict = {}
+    try:
+        raw = await client.rci_get(_RCI_PATHS["map_rc"])
+        map_rc = raw if isinstance(raw, dict) else {}
+    except Exception:  # noqa: BLE001
+        map_rc = {}
+    service: dict = {}
+    try:
+        service = await client.rci_get(_RCI_PATHS["service"])
+        if not isinstance(service, dict):
+            service = {}
+    except Exception:  # noqa: BLE001
+        service = {}
+    return {
+        "statuses": statuses,
+        "map_rc": map_rc,
+        "service": service,
+        "available_ids": sorted(set(statuses) | {k for k in map_rc if not str(k).startswith("__")}),
+    }
+
+
+def _parse_charon_status(ipsec_raw: Any, name: str) -> dict:
+    """Parse show/ipsec.ipsec_statusall for one connection (no secrets)."""
+    text = ""
+    if isinstance(ipsec_raw, dict):
+        text = str(ipsec_raw.get("ipsec_statusall") or ipsec_raw.get("statusall") or "")
+    elif isinstance(ipsec_raw, str):
+        text = ipsec_raw
+    if not text.strip():
+        return {
+            "available": False,
+            "sa_summary": None,
+            "ike_phase": "none",
+            "note": "show/ipsec has no ipsec_statusall text",
+        }
+
+    sa_summary = None
+    m = re.search(r"Security Associations\s*\(([^)]+)\)", text, re.I)
+    if m:
+        sa_summary = m.group(1).strip()
+
+    # Prefer per-connection CONNECTING/ESTABLISHED line for this name
+    ike_phase = "unknown"
+    conn_re = re.compile(
+        rf"(?im)^\s*{re.escape(name)}(?:\[\d+\])?:\s*(CONNECTING|ESTABLISHED|DELETING|PASSIVE)\b"
+    )
+    phases = conn_re.findall(text)
+    if phases:
+        # Prefer ESTABLISHED if any, else first seen
+        if any(p.upper() == "ESTABLISHED" for p in phases):
+            ike_phase = "ESTABLISHED"
+        else:
+            ike_phase = phases[0].upper()
+    elif sa_summary and "0 up" in sa_summary.lower() and "connecting" not in sa_summary.lower():
+        ike_phase = "none"
+    elif re.search(rf"(?i)\b{re.escape(name)}\b", text):
+        ike_phase = "unknown"
+    else:
+        ike_phase = "none"
+
+    tasks = None
+    tm = re.search(
+        rf"(?im)^\s*{re.escape(name)}(?:\[\d+\])?:.*Tasks active:\s*(.+)$",
+        text,
+    )
+    if tm:
+        tasks = tm.group(1).strip()
+    else:
+        # alternate block form: "active: IKE_INIT ..."
+        am = re.search(r"(?im)^\s*active:\s*(IKE_[A-Z0-9_ ]+)", text)
+        if am and re.search(rf"(?i)\b{re.escape(name)}\b", text):
+            tasks = am.group(1).strip()
+
+    note = (
+        "map ike_state may stay UNDEFINED while charon is CONNECTING"
+        if ike_phase == "CONNECTING"
+        else None
+    )
+    return {
+        key: value
+        for key, value in {
+            "available": True,
+            "sa_summary": sa_summary,
+            "ike_phase": ike_phase,
+            "tasks_active": tasks,
+            "note": note,
+        }.items()
+        if value is not None
+    }
 
 
 async def get_ipsec_runtime(name: str = "") -> dict:
@@ -556,28 +654,27 @@ async def get_ipsec_runtime(name: str = "") -> dict:
 
     Does not initiate IKE. On NDMS 5.01 enable/autoconnect/nail-up are config flags;
     ike_state=UNDEFINED with enabled=yes means NO_LINK (waiting for peer/traffic).
+    Reuses the same runtime builder as diagnose_ipsec_bringup.
     """
     async with _get_client() as client:
-        statuses = _normalize_status_map(await client.rci_get(_RCI_PATHS["status_map"]))
-        map_rc = {}
-        try:
-            raw = await client.rci_get(_RCI_PATHS["map_rc"])
-            map_rc = raw if isinstance(raw, dict) else {}
-        except Exception:  # noqa: BLE001
-            map_rc = {}
-        service = {}
-        try:
-            service = await client.rci_get(_RCI_PATHS["service"])
-        except Exception:  # noqa: BLE001
-            service = {}
+        ctx = await _fetch_runtime_context(client)
+    statuses = ctx["statuses"]
+    map_rc = ctx["map_rc"]
+    service = ctx["service"]
+    available_ids = ctx["available_ids"]
 
     if name.strip():
         key = name.strip()
         if key not in statuses and key not in map_rc:
-            raise ValueError(f"IPsec map not found: {key}")
+            return {
+                "ok": False,
+                "error": "not found",
+                "id": key,
+                "available_ids": available_ids,
+            }
         return {
             "ok": True,
-            "service_ipsec": _as_bool(service.get("ipsec")) if isinstance(service, dict) else None,
+            "service_ipsec": _as_bool(service.get("ipsec")),
             "runtime": _runtime_from_map_entry(key, statuses.get(key), map_rc.get(key)),
             "note": (
                 "enable/connect/nail-up are config flags; no RCI runtime IKE initiate on NDMS 5.01. "
@@ -585,13 +682,13 @@ async def get_ipsec_runtime(name: str = "") -> dict:
             ),
         }
 
-    items = []
-    keys = sorted(set(statuses) | set(map_rc))
-    for key in keys:
-        items.append(_runtime_from_map_entry(key, statuses.get(key), map_rc.get(key)))
+    items = [
+        _runtime_from_map_entry(key, statuses.get(key), map_rc.get(key))
+        for key in available_ids
+    ]
     return {
         "ok": True,
-        "service_ipsec": _as_bool(service.get("ipsec")) if isinstance(service, dict) else None,
+        "service_ipsec": _as_bool(service.get("ipsec")),
         "count": len(items),
         "runtime": items,
         "note": (
@@ -605,38 +702,41 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
     """Read-only checklist when map is enabled but ike_state stays UNDEFINED.
 
     Documents NDMS 5.01 finding: set_ipsec_state(enable) and map.connect (autoconnect)
-    do NOT send IKE_SA_INIT by themselves. nail-up holds SA after establish.
-    First bring-up typically needs interesting traffic to remote TS and/or peer
-    initiating. No fake connect_ipsec tool is exposed.
+    do NOT by themselves complete IKE. nail-up holds SA after establish.
+    Charon may already be CONNECTING while map ike_state stays UNDEFINED —
+    see diagnose.charon. No fake connect_ipsec tool is exposed.
     """
     if not name.strip():
         raise ValueError("name is required")
     conn_name = name.strip()
     async with _get_client() as client:
+        ctx = await _fetch_runtime_context(client)
         rc_s2s = await _load_rc_connections(client)
-        sc_s2s, statuses = await _load_connections(client)
-        map_rc = {}
-        try:
-            raw = await client.rci_get(_RCI_PATHS["map_rc"])
-            map_rc = raw if isinstance(raw, dict) else {}
-        except Exception as exc:  # noqa: BLE001
-            map_rc = {"__error__": str(exc).split("\n")[0][:160]}
-        service = {}
-        try:
-            service = await client.rci_get(_RCI_PATHS["service"])
-        except Exception:  # noqa: BLE001
-            service = {}
+        sc_s2s = _normalize_connections(await client.rci_get(_RCI_PATHS["connections"]))
         crypto = await client.rci_get(_RCI_PATHS["crypto"])
+        ipsec_raw = await client.rci_get(_RCI_PATHS["ipsec"])
+
+    statuses = ctx["statuses"]
+    map_rc = ctx["map_rc"]
+    service = ctx["service"]
+    available_ids = ctx["available_ids"]
 
     cfg = rc_s2s.get(conn_name) or sc_s2s.get(conn_name) or {}
-    if not cfg and conn_name not in statuses:
-        raise ValueError(f"IPsec connection not found: {conn_name}")
+    if not cfg and conn_name not in statuses and conn_name not in map_rc:
+        return {
+            "ok": False,
+            "error": "not found",
+            "id": conn_name,
+            "available_ids": available_ids,
+        }
 
+    # Same object builder + same snapshot as get_ipsec_runtime
     runtime = _runtime_from_map_entry(
         conn_name,
         statuses.get(conn_name),
         map_rc.get(conn_name) if isinstance(map_rc.get(conn_name), dict) else None,
     )
+    charon = _parse_charon_status(ipsec_raw, conn_name)
     checklist = []
     warnings = []
 
@@ -651,11 +751,8 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
     check(bool(cfg.get("ike-psk")), "ike-psk configured (has_psk)")
     check(bool(cfg.get("ipsec-local-networks")), "local traffic selector set")
     check(bool(cfg.get("ipsec-remote-networks")), "remote traffic selector set")
-    check(runtime.get("enabled") is True, "crypto map enabled (set_ipsec_state)", "enable ≠ IKE_SA_INIT")
-    check(
-        _as_bool(service.get("ipsec")) is True if isinstance(service, dict) else False,
-        "system service.ipsec=true",
-    )
+    check(runtime.get("enabled") is True, "crypto map enabled (set_ipsec_state)", "enable ≠ completed IKE")
+    check(_as_bool(service.get("ipsec")) is True, "system service.ipsec=true")
     map_connect = runtime.get("map_connect")
     autoconnect = _as_bool(cfg.get("autoconnect"))
     check(
@@ -669,20 +766,31 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
     )
 
     ike_undefined = runtime.get("ike_state") == "UNDEFINED"
+    charon_phase = str(charon.get("ike_phase") or "none").upper()
     if runtime.get("enabled") and ike_undefined:
+        if charon_phase == "CONNECTING":
+            warnings.append(
+                "map ike_state=UNDEFINED but charon is CONNECTING: local IKE attempt started; "
+                "if peer sees 0×UDP/500 — path/NAT/filter, not missing traffic-trigger"
+            )
+        elif charon_phase == "ESTABLISHED":
+            warnings.append(
+                "map ike_state=UNDEFINED but charon ESTABLISHED — map status lag; re-check get_ipsec_runtime"
+            )
+        else:
+            warnings.append(
+                "enabled=yes, map ike_state=UNDEFINED, no local charon SA: "
+                "no local IKE attempt yet; interesting traffic / peer initiate"
+            )
+            warnings.append(
+                "Workaround: generate interesting traffic from local TS to remote TS "
+                f"(e.g. {_split_subnets(cfg.get('ipsec-local-networks'))} → "
+                f"{_split_subnets(cfg.get('ipsec-remote-networks'))}), "
+                "or have the peer initiate; then re-check get_ipsec_runtime / show_ipsec_sa."
+            )
         warnings.append(
-            "enabled=yes but ike_state=UNDEFINED (UI NO_LINK): NDMS has not completed "
-            "IKE_SA_INIT. No RCI initiate/start/connect-action found on 5.01."
-        )
-        warnings.append(
-            "Workaround: generate interesting traffic from local TS to remote TS "
-            f"(e.g. {_split_subnets(cfg.get('ipsec-local-networks'))} → "
-            f"{_split_subnets(cfg.get('ipsec-remote-networks'))}), "
-            "or have the peer initiate; then re-check get_ipsec_runtime / show_ipsec_sa."
-        )
-        warnings.append(
-            "Do not expect set_ipsec_state(enable) or crypto map connect to produce "
-            "UDP/500|4500 by itself (live nc-office finding)."
+            "Do not expect set_ipsec_state(enable) or crypto map connect alone to finish "
+            "IKE; no RCI connect_ipsec on NDMS 5.01."
         )
     if runtime.get("connected"):
         warnings.append("PHASE2_ESTABLISHED — tunnel is up")
@@ -695,6 +803,7 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
         "ok": True,
         "id": conn_name,
         "runtime": runtime,
+        "charon": charon,
         "profile": {
             "peer": cfg.get("peer"),
             "passive": _as_bool(cfg.get("passive")),
@@ -705,11 +814,12 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
             "has_psk": bool(cfg.get("ike-psk")),
             "ike_protocol": cfg.get("ike-protocol"),
         },
-        "service_ipsec": _as_bool(service.get("ipsec")) if isinstance(service, dict) else None,
+        "service_ipsec": _as_bool(service.get("ipsec")),
         "checklist": checklist,
         "warnings": warnings,
         "research": {
             "runtime_initiate": "NOT_FOUND",
+            "no_tool": "connect_ipsec",
             "ui": "enable toggle only (crypto.map.enable + service.ipsec); no Connect button",
             "parse_crypto_map_connect": "config flag 'enable autoconnection' (≠ IKE_SA_INIT)",
             "nail_up": "active renegotiation / hold after SA",
@@ -717,7 +827,8 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
         },
         "next_steps": [
             "Confirm peer strongSwan listens on UDP/500 and UDP/4500 and IDs/PSK/TS match",
-            "From LAN host in local TS, send traffic to an IP in remote TS",
+            "If charon CONNECTING but peer sees 0 packets — check NAT/path/filter, not only traffic-trigger",
+            "From LAN host in local TS, send traffic to an IP in remote TS if charon has no SA yet",
             "Re-run get_ipsec_runtime / show_ipsec_sa; on VPS check swanctl --list-sas / tcpdump",
         ],
     })

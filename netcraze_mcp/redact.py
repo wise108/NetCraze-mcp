@@ -30,13 +30,25 @@ _SAFE_DENY_PATH_RE = re.compile(
     r")"
 )
 
+# "    password secretvalue" / "psk foo" style assignments.
 _CLI_SECRET_LINE_RE = re.compile(
     r"(?i)^(\s*(?:.*\s)?(?:"
-    r"password|passphrase|private-key|preshared-key|pre-shared-key|"
-    r"psk|secret|token|encryption-key|ike-psk"
+    r"password|passphrase|private-key|preshared-key|pre-shared-key|shared-key|"
+    r"pre-share|psk|secret|token|encryption-key|ike-psk|xauth-password"
     r")\s+)(\S+)(.*)$"
 )
+
+# NDMS: crypto ike key <name> <key-type> <MATERIAL> [id-type] [id…]
+# Live: crypto ike key nc-office ns3 <96-char-b64> dn weaselcloud-ipsec
+_CRYPTO_IKE_KEY_RE = re.compile(
+    r"(?i)^(\s*crypto\s+ike\s+key\s+\S+\s+\S+\s+)\S+(.*)$"
+)
+
+# WireGuard base64 keys (32 bytes → 44 chars with padding)
 _WG_KEY_RE = re.compile(r"[A-Za-z0-9+/]{42,44}=")
+
+# Long opaque key material that may appear without trailing '='
+_LONG_KEY_MATERIAL_RE = re.compile(r"[A-Za-z0-9+/]{48,}={0,2}")
 
 
 def is_secret_key(key: str) -> bool:
@@ -77,11 +89,19 @@ def redact_cli_text(text: str) -> str:
     """Strip secrets from running-config / CLI dump lines."""
     lines: list[str] = []
     for line in text.splitlines():
+        ike = _CRYPTO_IKE_KEY_RE.match(line)
+        if ike:
+            lines.append(f"{ike.group(1)}<REDACTED>{ike.group(2)}")
+            continue
         match = _CLI_SECRET_LINE_RE.match(line)
         if match:
             lines.append(f"{match.group(1)}<REDACTED>{match.group(3)}")
             continue
-        lines.append(_WG_KEY_RE.sub("<REDACTED>", line))
+        scrubbed = _WG_KEY_RE.sub("<REDACTED>", line)
+        # Avoid leaking long key blobs on key/psk lines that slipped past above.
+        if re.search(r"(?i)(key|psk|password|secret|shared)", scrubbed):
+            scrubbed = _LONG_KEY_MATERIAL_RE.sub("<REDACTED>", scrubbed)
+        lines.append(scrubbed)
     return "\n".join(lines)
 
 

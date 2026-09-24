@@ -128,12 +128,14 @@ create_ipsec_s2s(
 - `crypto map X disable` не существует → используем `no crypto map X enable`
 - PSK никогда не возвращается (`has_psk` only); нужен `confirm=true` + writable (не safe-mode)
 
-### IPsec runtime bring-up (0.11.0)
+### IPsec runtime bring-up (0.11.0 / hotfix 0.11.1)
 
 | Инструмент | Описание |
 |---|---|
 | `get_ipsec_runtime` | Read-only: enabled / ike_state / state / endpoints / map.connect|nail-up / ui_status |
-| `diagnose_ipsec_bringup` | Read-only checklist когда enable=yes, но IKE не стартует |
+| `diagnose_ipsec_bringup` | Read-only checklist + `charon` (CONNECTING/ESTABLISHED из `show/ipsec`) |
+
+**0.11.1:** `get_running_config_redacted` redact’ит `crypto ike key …`; runtime endpoints одинаковы в diagnose/get; diagnose не врёт «IKE не стартовал», если charon CONNECTING.
 
 **Research (websun NC-1812, NDMS 5.01 + ipsec 6.0.1-6) — runtime initiate NOT FOUND:**
 

@@ -739,8 +739,25 @@ async def test_get_ipsec_runtime_normalized(mock_client):
     assert rt["ui_status"] == "NO_LINK"
     assert rt["connected"] is False
     assert rt["map_connect"] is True
+    assert rt["local_endpoint"] == "0.0.0.0"
     assert result["service_ipsec"] is True
     assert "IKE" in result["note"] or "initiate" in result["note"]
+
+
+async def test_get_ipsec_runtime_not_found_lists_ids(mock_client):
+    async def rci_get(path):
+        if path == "show/crypto/map":
+            return {"crypto_map": {"nc-office": {"config": {"enabled": "yes"}, "status": {}}}}
+        if path == "show/rc/crypto/map":
+            return {"nc-office": {"enable": True}}
+        if path == "service":
+            return {"ipsec": True}
+        return {}
+
+    mock_client.rci_get.side_effect = rci_get
+    result = await get_ipsec_runtime("weasel-vps")
+    assert result["ok"] is False
+    assert result["available_ids"] == ["nc-office"]
 
 
 async def test_diagnose_ipsec_bringup_warns_undefined(mock_client):
@@ -764,7 +781,12 @@ async def test_diagnose_ipsec_bringup_warns_undefined(mock_client):
                 "crypto_map": {
                     "nc-office": {
                         "config": {"enabled": "yes"},
-                        "status": {"ike_state": "UNDEFINED", "state": "UNDEFINED"},
+                        "status": {
+                            "ike_state": "UNDEFINED",
+                            "state": "UNDEFINED",
+                            "local-endpoint-address": "192.168.0.16",
+                            "remote-endpoint-address": "45.89.63.73",
+                        },
                     }
                 }
             }
@@ -774,14 +796,50 @@ async def test_diagnose_ipsec_bringup_warns_undefined(mock_client):
             return {"ipsec": True}
         if path == "show/crypto":
             return {}
+        if path == "show/ipsec":
+            return {
+                "ipsec_statusall": (
+                    "Security Associations (0 up, 1 connecting):\n"
+                    "  nc-office[1]: CONNECTING, 192.168.0.16[%any]...45.89.63.73[%any]\n"
+                    "  nc-office[1]: Tasks active: IKE_INIT IKE_AUTH\n"
+                )
+            }
         return {}
 
     mock_client.rci_get.side_effect = rci_get
     result = await diagnose_ipsec_bringup("nc-office")
     assert result["research"]["runtime_initiate"] == "NOT_FOUND"
+    assert result["research"]["no_tool"] == "connect_ipsec"
     assert "secret-should-not-leak" not in str(result)
     assert result["profile"]["has_psk"] is True
-    assert any("UNDEFINED" in w for w in result["warnings"])
+    assert result["charon"]["ike_phase"] == "CONNECTING"
+    assert any("CONNECTING" in w for w in result["warnings"])
+    assert not any("no local IKE attempt yet" in w for w in result["warnings"])
+    # parity with get_ipsec_runtime on same mock snapshot
+    rt2 = await get_ipsec_runtime("nc-office")
+    assert result["runtime"]["local_endpoint"] == rt2["runtime"]["local_endpoint"]
+    assert result["runtime"]["remote_endpoint"] == rt2["runtime"]["remote_endpoint"]
+    assert result["runtime"]["ike_state"] == rt2["runtime"]["ike_state"]
+
+
+async def test_diagnose_not_found_lists_ids(mock_client):
+    async def rci_get(path):
+        if path == "show/crypto/map":
+            return {"crypto_map": {"nc-office": {"config": {}, "status": {}}}}
+        if "site-to-site" in path or path.endswith("map") or path == "service" or path in (
+            "show/crypto", "show/ipsec", "show/rc/crypto/map",
+        ):
+            if path == "show/rc/crypto/map":
+                return {"nc-office": {}}
+            if "site-to-site" in path:
+                return {"nc-office": {"peer": "1.2.3.4"}}
+            return {}
+        return {}
+
+    mock_client.rci_get.side_effect = rci_get
+    result = await diagnose_ipsec_bringup("weasel-vps")
+    assert result["ok"] is False
+    assert "nc-office" in result["available_ids"]
 
 
 def test_no_fake_connect_ipsec_tool_exported():
@@ -1722,6 +1780,17 @@ def test_redact_cli_private_key_line():
     assert "AbCdEf" not in out
     assert "<REDACTED>" in out
     assert "listen-port 51820" in out
+
+
+def test_redact_cli_crypto_ike_key_line():
+    line = (
+        "crypto ike key nc-office ns3 "
+        "D6xWqe8MESXRoF1xPtI+W0IAl7iBPb1LVW2NnAYZJt9Vxswl747VCYkxTkdZp/meknm+uaTeZeqk5/QMphRlK/p5t0g2+Fpa "
+        "dn weaselcloud-ipsec"
+    )
+    out = redact_cli_text(line)
+    assert "D6xWqe8MESXRoF1x" not in out
+    assert "crypto ike key nc-office ns3 <REDACTED> dn weaselcloud-ipsec" == out
 
 
 def test_rci_get_safe_denies_secrets_path():
