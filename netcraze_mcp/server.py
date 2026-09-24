@@ -7,11 +7,20 @@ from .config import configure
 from .tools import register_tools
 from .tools.backup import download_system_file, export_backup
 from .tools.components import (
+    get_component,
     get_firmware_info,
     install_component,
     list_components,
     remove_component,
 )
+from .tools.diagnostics import router_nslookup, router_ping, router_traceroute
+from .tools.firewall import list_firewall_rules, list_nat_rules
+from .tools.health import get_running_config_redacted, health_check
+from .tools.policy import get_connection_priorities, get_policy_routing_summary
+from .tools.rci_access import rci_get, rci_get_safe
+from .tools.vpn import get_vpn_connection, list_vpn_connections
+from .tools.wan import get_public_ip, get_wan_details
+from .tools.zerotier import get_zerotier, list_zerotier
 from .tools.dns_routes import (
     add_dns_route,
     add_domains,

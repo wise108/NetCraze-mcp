@@ -72,6 +72,53 @@ async def list_components(installed_only: bool = False, group: str = "") -> list
     return result
 
 
+async def get_component(name: str) -> dict:
+    """One NDMS component: installed, version, description, dependencies if known."""
+    if not name.strip():
+        raise ValueError("name is required")
+    needle = name.strip()
+    async with _get_client() as client:
+        version = await client.rci_get("show/version")
+        catalog = await client.rci({"components": {"list": {}}})
+    installed = {
+        item.strip()
+        for item in str((version.get("ndw") or {}).get("components") or "").split(",")
+        if item.strip()
+    }
+    components = ((catalog.get("components") or {}).get("list") or {}).get("component") or {}
+    if not isinstance(components, dict) or needle not in components:
+        # case-insensitive fallback
+        match = next((k for k in components if isinstance(components, dict) and k.lower() == needle.lower()), None)
+        if match is None:
+            raise ValueError(f"Component not found: {needle}")
+        needle = match
+    meta = components[needle] if isinstance(components, dict) else {}
+    if not isinstance(meta, dict):
+        raise ValueError(f"Component not found: {needle}")
+    deps = meta.get("depends") or meta.get("dependencies") or meta.get("require")
+    if isinstance(deps, str):
+        deps = [part.strip() for part in deps.split(",") if part.strip()]
+    features = (version.get("ndw") or {}).get("features") if isinstance(version, dict) else None
+    return {
+        key: value
+        for key, value in {
+            "name": needle,
+            "installed": needle in installed,
+            "group": meta.get("group"),
+            "description": _component_description(meta) or None,
+            "version": meta.get("version"),
+            "size": int(meta["size"]) if str(meta.get("size") or "").isdigit() else meta.get("size"),
+            "dependencies": deps or None,
+            "ndw_features": features,
+            "note": (
+                "related CLI/RCI feature flags come from show/version ndw.features when present; "
+                "component packaging does not always expose a dedicated flag map."
+            ),
+        }.items()
+        if value is not None
+    }
+
+
 async def get_firmware_info() -> dict:
     """Firmware version, update channel/sandbox and component summary."""
     async with _get_client() as client:
@@ -135,6 +182,7 @@ async def remove_component(name: str, commit: bool = True) -> dict:
 
 def register(mcp) -> None:
     mcp.tool()(list_components)
+    mcp.tool()(get_component)
     mcp.tool()(get_firmware_info)
     mcp.tool()(install_component)
     mcp.tool()(remove_component)

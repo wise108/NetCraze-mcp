@@ -86,6 +86,27 @@ add_dns_route(list_name="Gemini", interface="Wireguard3", auto=true, enabled=tru
 > WRITE (`create_ipsec_s2s` / `set_ipsec_state` / `delete_ipsec`) — отдельно, пока не реализовано.  
 > На NDMS 5.01 путь `show/crypto/ipsec/sa` отсутствует (404); статус туннелей — в `show/crypto/map`.
 
+### Raw RCI + аудит (read-only, 0.9.0)
+
+| Инструмент | Описание |
+|---|---|
+| `rci_get` | GET `/rci/<path>` с auth MCP; авто-redact password/psk/private-key/secret/token |
+| `rci_get_safe` | То же + deny-list путей с секретами |
+| `get_wan_details` | WAN: IP/mask/gw/DNS/MTU/тип, `behind_nat`, `upstream_gateway`, public IP hint |
+| `get_public_ip` | Public IP из NDNS/CrazeDNS или `unsupported` (без смены маршрутов) |
+| `list_zerotier` / `get_zerotier` | Сеть/IP/status + peers (без tokens) |
+| `list_vpn_connections` / `get_vpn_connection` | Единый список WG/OpenVPN/PPTP/L2TP/SSTP/IPsec/GRE/ZT… |
+| `get_connection_priorities` | `ip global` priority + Policy tables |
+| `get_policy_routing_summary` | DNS-routes + static routes + ip rule/policy |
+| `list_firewall_rules` | access-list + security-level |
+| `list_nat_rules` | port forwards + UPnP + count conntrack (без полного dump) |
+| `router_ping` / `router_traceroute` / `router_nslookup` | Диагностика с лимитами (ping count≤5; traceroute hops≤15) |
+| `get_running_config_redacted` | `show/running-config` без секретов; `filter=interface|crypto|ip|…` |
+| `health_check` | auth/firmware/uptime/WAN + понятные ошибки (timeout/auth/HTTP) |
+| `get_component` | Один NDMS-компонент: installed/version/deps |
+
+> WRITE только у существующих `set_*` / `add_*` / `delete_*` / `reboot` / components (и только вне safe-mode). Диагностические tools никогда не меняют конфиг.
+
 ### Система, сеть, DNS-маршрутизация (upstream)
 
 `get_system_info`, `reboot`, `get_interfaces`, `get_interface`, `get_connected_clients`, `get_wifi_associations`, `get_speed`, `get_routes`, `get_wan_status`, `get_wan_speed`, `get_domain_lists`, `get_domain_list`, `create_domain_list`, `delete_domain_list`, `set_domain_list`, `add_domains`, `remove_domains`, `get_dns_routes`, `add_dns_route`, `delete_dns_route`, `set_interface_state`

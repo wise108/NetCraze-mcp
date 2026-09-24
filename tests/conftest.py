@@ -6,14 +6,22 @@ from unittest.mock import AsyncMock
 import netcraze_mcp.config as config
 import netcraze_mcp.tools.backup as backup_tools
 import netcraze_mcp.tools.components as components_tools
+import netcraze_mcp.tools.diagnostics as diagnostics_tools
 import netcraze_mcp.tools.dns_routes as dns_routes_tools
+import netcraze_mcp.tools.firewall as firewall_tools
+import netcraze_mcp.tools.health as health_tools
+import netcraze_mcp.tools.ipsec as ipsec_tools
 import netcraze_mcp.tools.network as network_tools
+import netcraze_mcp.tools.policy as policy_tools
+import netcraze_mcp.tools.rci_access as rci_access_tools
 import netcraze_mcp.tools.static_hosts as static_hosts_tools
 import netcraze_mcp.tools.static_routes as static_routes_tools
 import netcraze_mcp.tools.storage as storage_tools
 import netcraze_mcp.tools.system as system_tools
+import netcraze_mcp.tools.vpn as vpn_tools
+import netcraze_mcp.tools.wan as wan_tools
 import netcraze_mcp.tools.wireguard as wireguard_tools
-import netcraze_mcp.tools.ipsec as ipsec_tools
+import netcraze_mcp.tools.zerotier as zerotier_tools
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +43,9 @@ class MockNetCrazeClient:
         self.rci_get = AsyncMock(return_value={})
         self.ci_get_bytes = AsyncMock(return_value=b"")
         self.rci_post = AsyncMock(return_value={})
+        self.rci_continued = AsyncMock(
+            return_value={"messages": [], "continued": False, "polls": 0}
+        )
 
     async def __aenter__(self):
         return self
@@ -56,6 +67,14 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
         storage_tools,
         wireguard_tools,
         ipsec_tools,
+        wan_tools,
+        zerotier_tools,
+        vpn_tools,
+        policy_tools,
+        firewall_tools,
+        diagnostics_tools,
+        health_tools,
+        rci_access_tools,
     ):
         monkeypatch.setattr(module, "_get_client", getter)
 

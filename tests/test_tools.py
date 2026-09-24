@@ -1333,3 +1333,273 @@ async def test_configure_none_defers_to_env(mock_client, monkeypatch):
     configure(safe_mode=None)
     with pytest.raises(PermissionError):
         await reboot()
+
+
+# ─── rci_get / redact / WAN / VPN / health (0.9.0) ────────────────────────────
+
+from netcraze_mcp.redact import is_denied_safe_path, redact_cli_text, redact_value
+from netcraze_mcp.tools.diagnostics import router_ping
+from netcraze_mcp.tools.firewall import list_firewall_rules, list_nat_rules
+from netcraze_mcp.tools.health import get_running_config_redacted, health_check
+from netcraze_mcp.tools.policy import get_connection_priorities
+from netcraze_mcp.tools.rci_access import rci_get, rci_get_safe
+from netcraze_mcp.tools.vpn import list_vpn_connections
+from netcraze_mcp.tools.wan import get_public_ip, get_wan_details
+from netcraze_mcp.tools.zerotier import list_zerotier
+from netcraze_mcp.tools.components import get_component
+
+
+def test_redact_value_strips_private_key():
+    data = {"interface": {"wireguard": {"private-key": "abc", "public-key": "pub"}}}
+    out = redact_value(data)
+    assert out["interface"]["wireguard"]["private-key"] == "<REDACTED>"
+    assert out["interface"]["wireguard"]["public-key"] == "pub"
+
+
+def test_redact_cli_private_key_line():
+    text = "    private-key AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcde=\n    listen-port 51820"
+    out = redact_cli_text(text)
+    assert "AbCdEf" not in out
+    assert "<REDACTED>" in out
+    assert "listen-port 51820" in out
+
+
+def test_rci_get_safe_denies_secrets_path():
+    assert is_denied_safe_path("show/crypto/ipsec/secrets")
+    assert is_denied_safe_path("interface/Wireguard0/wireguard/private-key")
+    assert not is_denied_safe_path("show/system")
+
+
+async def test_rci_get_redacts(mock_client):
+    mock_client.rci_get.return_value = {"password": "secret", "hostname": "r1"}
+    result = await rci_get("show/system")
+    assert result["ok"] is True
+    assert result["data"]["password"] == "<REDACTED>"
+    assert result["data"]["hostname"] == "r1"
+
+
+async def test_rci_get_safe_blocks(mock_client):
+    result = await rci_get_safe("show/ipsec/password")
+    assert result["ok"] is False
+    assert result["denied"] is True
+    mock_client.rci_get.assert_not_called()
+
+
+async def test_get_wan_details_behind_nat(mock_client):
+    mock_client.rci_get.side_effect = [
+        {
+            "GigabitEthernet1": {
+                "id": "GigabitEthernet1",
+                "interface-name": "ISP",
+                "type": "GigabitEthernet",
+                "address": "192.168.0.16",
+                "mask": "255.255.255.0",
+                "mtu": 1500,
+                "global": True,
+                "defaultgw": True,
+                "priority": 64520,
+                "link": "up",
+                "state": "up",
+                "connected": "yes",
+                "description": "ISP",
+            }
+        },
+        {
+            "internet": True,
+            "gateway": {"interface": "GigabitEthernet1", "address": "192.168.0.1"},
+        },
+        {"address": "", "ttp": {"direct": False, "address": "192.168.0.16"}},
+        {"route": [{"destination": "0.0.0.0/0", "gateway": "192.168.0.1", "interface": "GigabitEthernet1"}]},
+        {"GigabitEthernet1": {"ip": {"address": {"dhcp": True}}}},
+    ]
+    result = await get_wan_details()
+    assert result["ok"] is True
+    assert result["ipv4"]["address"] == "192.168.0.16"
+    assert result["upstream_gateway"] == "192.168.0.1"
+    assert result["behind_nat"] is True
+
+
+async def test_get_public_ip_unsupported(mock_client):
+    mock_client.rci_get.side_effect = [
+        {"address": "", "ttp": {"direct": False, "address": "192.168.0.16"}},
+        {"gateway": {"interface": "GigabitEthernet1"}},
+        {"GigabitEthernet1": {"id": "GigabitEthernet1", "address": "192.168.0.16", "global": True, "defaultgw": True, "link": "up", "type": "GigabitEthernet"}},
+    ]
+    result = await get_public_ip()
+    assert result["unsupported"] is True
+    assert result["wan_ipv4"] == "192.168.0.16"
+
+
+async def test_list_zerotier(mock_client):
+    mock_client.rci_get.return_value = {
+        "ZeroTier0": {
+            "id": "ZeroTier0",
+            "type": "ZeroTier",
+            "address": "10.211.114.2",
+            "mask": "255.255.255.0",
+            "state": "up",
+            "link": "up",
+            "connected": "yes",
+            "zerotier": {
+                "network-id": "b9a18a606f598b24",
+                "network-name": "WebSun",
+                "status": "OK",
+                "token": "SHOULD_NOT_LEAK",
+            },
+        }
+    }
+    mock_client.rci.return_value = {
+        "show": {"interface": {"zerotier": {"peers": {"peer": [
+            {"address": "abc", "latency": 10, "role": "LEAF", "path": ["1.2.3.4/9993"]},
+        ]}}}}
+    }
+    result = await list_zerotier()
+    assert result[0]["address"] == "10.211.114.2"
+    assert result[0]["network_id"] == "b9a18a606f598b24"
+    assert "SHOULD_NOT_LEAK" not in str(result)
+    assert result[0]["peers_count"] == 1
+
+
+async def test_list_vpn_connections(mock_client):
+    mock_client.rci_get.side_effect = lambda path: {
+        "show/interface": {
+            "Wireguard0": {"id": "Wireguard0", "type": "Wireguard", "state": "up", "link": "up", "connected": "yes", "address": "10.0.0.1"},
+            "ZeroTier0": {"id": "ZeroTier0", "type": "ZeroTier", "state": "up", "link": "up", "connected": "yes", "address": "10.211.114.2"},
+        },
+        "show/sc/crypto/ipsec/site-to-site": {},
+        "show/crypto/map": {},
+    }.get(path, {})
+    result = await list_vpn_connections()
+    ids = {item["id"] for item in result}
+    assert "Wireguard0" in ids
+    assert "ZeroTier0" in ids
+
+
+async def test_get_connection_priorities(mock_client):
+    mock_client.rci_get.side_effect = [
+        {
+            "GigabitEthernet1": {
+                "id": "GigabitEthernet1", "type": "GigabitEthernet", "global": True,
+                "defaultgw": True, "priority": 64520, "address": "192.168.0.16", "state": "up", "link": "up",
+            },
+            "Wireguard1": {
+                "id": "Wireguard1", "type": "Wireguard", "global": True,
+                "defaultgw": False, "priority": 16130, "address": "10.13.13.3", "state": "up", "link": "up",
+            },
+        },
+        {"Policy0": {"description": "VPN", "mark": "ffffaaa", "table4": 4096, "route4": {"route": []}}},
+    ]
+    result = await get_connection_priorities()
+    assert result["ok"] is True
+    assert result["internet_order"][0]["id"] == "GigabitEthernet1"
+    assert result["default_wan"]["id"] == "GigabitEthernet1"
+
+
+async def test_list_firewall_and_nat(mock_client):
+    async def _get(path):
+        if path == "show/sc/access-list":
+            return [{"acl": "_WEBADMIN_Bridge0", "action": "permit", "protocol": "ip"}]
+        if path == "show/interface":
+            return {"Bridge0": {"id": "Bridge0", "security-level": "private"}}
+        if path == "show/sc/ip/static":
+            return [{"interface": "GigabitEthernet1", "protocol": "tcpudp", "port": "6060", "comment": "RDP"}]
+        if path == "show/upnp/redirect":
+            return {"entry": []}
+        if path == "show/ip/nat":
+            return [{"protocol": "TCP"}] * 3
+        return {}
+    mock_client.rci_get.side_effect = _get
+    fw = await list_firewall_rules()
+    assert fw["ok"] is True
+    assert fw["count"] == 1
+    nat = await list_nat_rules()
+    assert nat["port_forwards_count"] == 1
+    assert nat["conntrack_sessions"] == 3
+
+
+async def test_router_ping(mock_client):
+    mock_client.rci_continued.return_value = {
+        "messages": [
+            "PING 1.1.1.1 (1.1.1.1) 56 (84) bytes of data.",
+            "84 bytes from 1.1.1.1: icmp_req=1, ttl=58, time=12.0 ms.",
+            "--- 1.1.1.1 ping statistics ---",
+            "2 packets transmitted, 2 packets received, 0% packet loss,",
+            "Round-trip min/avg/max = 12.0/12.5/13.0 ms.",
+        ],
+        "continued": False,
+        "polls": 1,
+    }
+    result = await router_ping("1.1.1.1", count=2)
+    assert result["ok"] is True
+    assert result["received"] == 2
+
+
+async def test_running_config_redacted(mock_client):
+    mock_client.rci_get.return_value = {
+        "message": [
+            "interface Wireguard0",
+            "    wireguard",
+            "        private-key AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd=",
+            "    up",
+            "!",
+            "system",
+            "    set hostname router",
+            "!",
+        ]
+    }
+    result = await get_running_config_redacted(filter="interface")
+    assert result["ok"] is True
+    assert "private-key" in result["config"]
+    assert "AbCdEfGh" not in result["config"]
+    assert "<REDACTED>" in result["config"]
+    assert "set hostname" not in result["config"]
+
+
+async def test_health_check_ok(mock_client):
+    mock_client.rci_get.side_effect = [
+        {"release": "5.01", "title": "Ultra", "sandbox": "stable"},
+        {"hostname": "router.websun", "uptime": "100"},
+        {"internet": True, "reliable": True, "gateway": {"interface": "GigabitEthernet1", "address": "192.168.0.1"}},
+    ]
+    result = await health_check()
+    assert result["ok"] is True
+    assert result["auth_ok"] is True
+    assert result["wan_internet"] is True
+    assert result["firmware"] == "5.01"
+
+
+async def test_health_check_connect_error(monkeypatch):
+    from netcraze_mcp.client import NetCrazeError
+    import netcraze_mcp.tools.health as ht
+
+    class Boom:
+        async def __aenter__(self):
+            raise NetCrazeError("ConnectTimeout to 10.0.0.1 (GET /auth): router unreachable")
+
+        async def __aexit__(self, *_):
+            return False
+
+    monkeypatch.setattr(ht, "_get_client", lambda: Boom())
+    result = await health_check()
+    assert result["ok"] is False
+    assert "ConnectTimeout" in result["error"]
+
+async def test_get_component(mock_client):
+    mock_client.rci_get.return_value = {
+        "ndw": {"components": "base,zerotier", "features": "usb_3"},
+    }
+    mock_client.rci.return_value = {
+        "components": {"list": {"component": {
+            "zerotier": {
+                "group": "VPN",
+                "description": {"EN": "ZeroTier"},
+                "version": "1.16",
+                "size": "100",
+                "depends": "base",
+            }
+        }}}
+    }
+    result = await get_component("zerotier")
+    assert result["installed"] is True
+    assert result["version"] == "1.16"
+    assert result["dependencies"] == ["base"]
