@@ -852,6 +852,296 @@ def test_no_fake_connect_ipsec_tool_exported():
     assert "def disconnect_ipsec" not in src
 
 
+def test_parse_charon_none_when_zero_connecting():
+    from netcraze_mcp.tools.ipsec import _parse_charon_status
+    text = (
+        "Security Associations (0 up, 0 connecting):\n"
+        "  weasel-vps:  192.168.0.16...45.89.63.73  IKEv2\n"
+    )
+    parsed = _parse_charon_status({"ipsec_statusall": text}, "weasel-vps")
+    assert parsed["ike_phase"] == "none"
+    assert parsed["sa_summary"] == "0 up, 0 connecting"
+
+
+def test_s2s_flat_payload_omits_empty_ike_prf():
+    payload = _s2s_flat_payload(
+        name="tmp",
+        peer="1.2.3.4",
+        ike_psk="x",
+        local_id="a",
+        remote_id="b",
+        local_networks="10.0.0.0/24",
+        remote_networks="10.1.0.0/24",
+        ike_prf="",
+    )
+    assert "ike-prf" not in payload
+    payload2 = _s2s_flat_payload(
+        name="tmp2",
+        peer="1.2.3.4",
+        ike_psk="x",
+        local_id="a",
+        remote_id="b",
+        local_networks="10.0.0.0/24",
+        remote_networks="10.1.0.0/24",
+        ike_prf=None,
+    )
+    assert "ike-prf" not in payload2
+
+
+async def test_diagnose_charon_none_and_conntrack(mock_client):
+    async def rci_get(path):
+        cfg = {
+            "weasel-vps": {
+                "peer": "45.89.63.73",
+                "ike-psk": "secret-should-not-leak",
+                "autoconnect": True,
+                "nail-up": True,
+                "passive": False,
+                "ipsec-local-networks": "192.168.1.0/24",
+                "ipsec-remote-networks": "1.1.1.1/32",
+                "ike-protocol": "ikev2",
+            }
+        }
+        if "site-to-site" in path:
+            return cfg
+        if path == "show/crypto/map":
+            return {
+                "crypto_map": {
+                    "weasel-vps": {
+                        "config": {"enabled": "yes", "remote_peer": "45.89.63.73"},
+                        "status": {
+                            "ike_state": "UNDEFINED",
+                            "state": "UNDEFINED",
+                            "local-endpoint-address": "192.168.0.16",
+                            "remote-endpoint-address": "45.89.63.73",
+                        },
+                    }
+                }
+            }
+        if path == "show/rc/crypto/map":
+            return {"weasel-vps": {"connect": True, "nail-up": True, "enable": True}}
+        if path == "service":
+            return {"ipsec": True}
+        if path == "show/crypto":
+            return {}
+        if path == "show/ipsec":
+            return {
+                "ipsec_statusall": "Security Associations (0 up, 0 connecting):\nnone\n"
+            }
+        if path == "show/ip/nat":
+            return [
+                {
+                    "protocol": "UDP",
+                    "src": "192.168.0.16",
+                    "dst": "45.89.63.73",
+                    "sport": 500,
+                    "dport": 500,
+                    "packets": 80,
+                    "bytes": 39360,
+                    "packets-out": 0,
+                    "bytes-out": 0,
+                    "flags": ["FASTNAT"],
+                },
+                {
+                    "protocol": "TCP",
+                    "src": "192.168.0.16",
+                    "dst": "45.89.63.73",
+                    "sport": 443,
+                    "dport": 443,
+                    "packets": 1,
+                    "bytes": 60,
+                },
+            ]
+        return {}
+
+    mock_client.rci_get.side_effect = rci_get
+    result = await diagnose_ipsec_bringup("weasel-vps")
+    assert result["charon"]["ike_phase"] == "none"
+    assert result["ike_path"]["conntrack"]["count"] == 1
+    assert result["ike_path"]["conntrack"]["summary"]["udp500_out"] is True
+    assert result["ike_path"]["conntrack"]["summary"]["udp500_reply"] is False
+    assert "secret-should-not-leak" not in str(result)
+
+    from netcraze_mcp.tools.ipsec import get_ike_conntrack
+    ct = await get_ike_conntrack(name="weasel-vps")
+    assert ct["ok"] is True
+    assert ct["count"] == 1
+    assert ct["sessions"][0]["dport"] == 500
+
+
+async def test_rename_ipsec_roundtrip_no_psk_in_args(mock_client):
+    from netcraze_mcp.tools.ipsec import rename_ipsec
+    configure(safe_mode=False)
+    store = {
+        "weasel-vps": {
+            "name": "weasel-vps",
+            "peer": "45.89.63.73",
+            "ike-protocol": "ikev2",
+            "ike-psk": "LiveSecretMustStayInternal",
+            "ike-local-id-type": "dn",
+            "ike-local-id": "office-nc1812",
+            "ike-remote-id-type": "dn",
+            "ike-remote-id": "weaselcloud-ipsec",
+            "ipsec-local-networks": "192.168.1.0/24",
+            "ipsec-remote-networks": "1.1.1.1/32",
+            "ike-aead": False,
+            "ike-encryption": "aes-cbc-256",
+            "ike-integrity": "sha256",
+            "ike-prf": "",
+            "ike-dh": "14",
+            "ike-lifetime": "86400",
+            "ipsec-aead": False,
+            "ipsec-encryption": "esp-aes-256",
+            "ipsec-integrity": "esp-sha256-hmac",
+            "ipsec-dh": "14",
+            "ipsec-lifetime": "28800",
+            "dpd": True,
+            "dpd-interval": "30",
+            "nail-up": True,
+            "autoconnect": True,
+            "passive": False,
+            "ike-mode": "main",
+            "ipsec-mode": "tunnel",
+        }
+    }
+
+    async def rci(payload):
+        if isinstance(payload, list):
+            body = payload[0]
+        else:
+            body = payload
+        if "parse" in body:
+            return {"ok": True}
+        if "system" in body:
+            return {"ok": True}
+        if "service" in body:
+            return {"ok": True}
+        s2s = ((body.get("crypto") or {}).get("ipsec") or {}).get("site-to-site") or {}
+        if s2s.get("no"):
+            store.pop(s2s["name"], None)
+            return {"ok": True}
+        name = s2s["name"]
+        assert "ike-psk" in s2s and s2s["ike-psk"] == "LiveSecretMustStayInternal"
+        assert "ike-prf" not in s2s  # empty source prf omitted
+        store[name] = dict(s2s)
+        return {"ok": True}
+
+    async def rci_get(path):
+        if "site-to-site" in path:
+            return {k: dict(v) for k, v in store.items()}
+        if path == "show/crypto/map":
+            return {
+                "crypto_map": {
+                    k: {"config": {"enabled": "yes"}, "status": {"state": "UNDEFINED"}}
+                    for k in store
+                }
+            }
+        return {}
+
+    mock_client.rci.side_effect = rci
+    mock_client.rci_get.side_effect = rci_get
+
+    renamed = await rename_ipsec("weasel-vps", "weasel-vps-tmp", confirm=True)
+    assert renamed["renamed"] is True
+    assert renamed["old_id"] == "weasel-vps"
+    assert renamed["id"] == "weasel-vps-tmp"
+    assert "LiveSecret" not in str(renamed)
+    assert list(store.keys()) == ["weasel-vps-tmp"]
+
+    back = await rename_ipsec("weasel-vps-tmp", "weasel-vps", confirm=True)
+    assert back["id"] == "weasel-vps"
+    assert list(store.keys()) == ["weasel-vps"]
+    configure(safe_mode=None)
+
+
+async def test_clone_ipsec_no_psk_in_response(mock_client):
+    from netcraze_mcp.tools.ipsec import clone_ipsec, delete_ipsec
+    configure(safe_mode=False)
+    store = {
+        "weasel-vps": {
+            "name": "weasel-vps",
+            "peer": "45.89.63.73",
+            "ike-protocol": "ikev2",
+            "ike-psk": "CloneSecretInternalOnly",
+            "ike-local-id-type": "dn",
+            "ike-local-id": "office-nc1812",
+            "ike-remote-id-type": "dn",
+            "ike-remote-id": "weaselcloud-ipsec",
+            "ipsec-local-networks": "192.168.1.0/24",
+            "ipsec-remote-networks": "1.1.1.1/32",
+            "ike-aead": False,
+            "ike-encryption": "aes-cbc-256",
+            "ike-integrity": "sha256",
+            "ike-prf": "",
+            "ike-dh": "14",
+            "ike-lifetime": "86400",
+            "ipsec-aead": False,
+            "ipsec-encryption": "esp-aes-256",
+            "ipsec-integrity": "esp-sha256-hmac",
+            "ipsec-dh": "14",
+            "ipsec-lifetime": "28800",
+            "dpd": True,
+            "dpd-interval": "30",
+            "nail-up": True,
+            "autoconnect": True,
+            "passive": False,
+            "ike-mode": "main",
+            "ipsec-mode": "tunnel",
+        }
+    }
+
+    async def rci(payload):
+        body = payload[0] if isinstance(payload, list) else payload
+        if "parse" in body or "system" in body or "service" in body:
+            return {"ok": True}
+        s2s = ((body.get("crypto") or {}).get("ipsec") or {}).get("site-to-site") or {}
+        if s2s.get("no"):
+            store.pop(s2s["name"], None)
+            return {"ok": True}
+        store[s2s["name"]] = dict(s2s)
+        return {"ok": True}
+
+    async def rci_get(path):
+        if "site-to-site" in path:
+            return {k: dict(v) for k, v in store.items()}
+        if path == "show/crypto/map":
+            return {
+                "crypto_map": {
+                    k: {"config": {"enabled": "yes"}, "status": {}}
+                    for k in store
+                }
+            }
+        return {}
+
+    mock_client.rci.side_effect = rci
+    mock_client.rci_get.side_effect = rci_get
+
+    cloned = await clone_ipsec("weasel-vps", "weasel-vps-clone-tmp", confirm=True)
+    assert cloned["action"] == "created"
+    assert cloned["id"] == "weasel-vps-clone-tmp"
+    assert "CloneSecret" not in str(cloned)
+    assert "weasel-vps-clone-tmp" in store
+    deleted = await delete_ipsec("weasel-vps-clone-tmp", confirm=True)
+    assert deleted["deleted"] is True
+    assert "weasel-vps-clone-tmp" not in store
+    configure(safe_mode=None)
+
+
+async def test_packet_capture_status_without_monitor(mock_client):
+    from netcraze_mcp.tools.ipsec import get_packet_capture_status
+
+    async def rci_get(path):
+        if path == "show/version":
+            return {"ndw": {"components": "usb,storage,ipsec"}}
+        raise RuntimeError(f"404 {path}")
+
+    mock_client.rci_get.side_effect = rci_get
+    result = await get_packet_capture_status()
+    assert result["monitor_installed"] is False
+    assert result["capture_available"] is False
+    assert "monitor" in result["message"]
+
+
 # ─── components / firmware / storage ──────────────────────────────────────────
 
 async def test_list_components_marks_installed_and_filters(mock_client):

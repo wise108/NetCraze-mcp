@@ -89,7 +89,9 @@ add_dns_route(list_name="Gemini", interface="Wireguard3", auto=true, enabled=tru
 
 | Инструмент | Описание |
 |---|---|
-| `create_ipsec_s2s` | Создать/обновить S2S (idempotent по `name`); **confirm=true** обязателен |
+| `create_ipsec_s2s` | Создать/обновить S2S (idempotent по `name`); `source_name`+keep_psk без PSK в args; **confirm=true** |
+| `clone_ipsec` | Clone профиля (PSK только в памяти); **confirm=true** |
+| `rename_ipsec` | Rename без PSK в args (create+delete в памяти); **confirm=true** |
 | `update_ipsec_s2s` | Full-replace RMW; `keep_psk=true` читает PSK из RC только в памяти |
 | `set_ipsec_state` | Только `parse crypto map … enable` / `no crypto map … enable` (+ `service.ipsec=true` при enable) |
 | `delete_ipsec` | Flat `{name, no: true}` → «removed crypto map.» |
@@ -128,14 +130,20 @@ create_ipsec_s2s(
 - `crypto map X disable` не существует → используем `no crypto map X enable`
 - PSK никогда не возвращается (`has_psk` only); нужен `confirm=true` + writable (не safe-mode)
 
-### IPsec runtime bring-up (0.11.0 / hotfix 0.11.1)
+### IPsec runtime bring-up (0.11.0 / hotfix 0.11.1 / 0.11.2)
 
 | Инструмент | Описание |
 |---|---|
 | `get_ipsec_runtime` | Read-only: enabled / ike_state / state / endpoints / map.connect|nail-up / ui_status |
-| `diagnose_ipsec_bringup` | Read-only checklist + `charon` (CONNECTING/ESTABLISHED из `show/ipsec`) |
+| `diagnose_ipsec_bringup` | Read-only checklist + `charon` + `ike_path.conntrack` |
+| `get_ike_conntrack` | Read-only фильтр `show/ip/nat` по peer + UDP/500|4500 (без полного dump) |
+| `get_packet_capture_status` | Read-only: установлен ли `monitor` / доступен ли capture (**не** ставит компонент) |
+| `rename_ipsec` | Rename S2S без передачи PSK агенту (PSK только в памяти) |
+| `clone_ipsec` / `create_ipsec_s2s(source_name=…)` | Clone с `keep_psk`; `ike_psk` не required |
 
 **0.11.1:** `get_running_config_redacted` redact’ит `crypto ike key …`; runtime endpoints одинаковы в diagnose/get; diagnose не врёт «IKE не стартовал», если charon CONNECTING.
+
+**0.11.2:** `rename_ipsec` / `clone_ipsec` / `source_name`; `get_ike_conntrack`; `ike_phase=none` при `0 up, 0 connecting`; `ike_prf=""` omit; `get_packet_capture_status`.
 
 **Research (websun NC-1812, NDMS 5.01 + ipsec 6.0.1-6) — runtime initiate NOT FOUND:**
 

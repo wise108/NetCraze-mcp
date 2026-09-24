@@ -1,7 +1,8 @@
 """IPsec site-to-site tools (NDMS crypto map / site-to-site).
 
-Read-only: list/get/proposals/show/runtime/diagnose.
-Write: create_ipsec_s2s / update_ipsec_s2s / set_ipsec_state / delete_ipsec.
+Read-only: list/get/proposals/show/runtime/diagnose/ike_conntrack/capture_status.
+Write: create_ipsec_s2s / update_ipsec_s2s / clone_ipsec / rename_ipsec /
+set_ipsec_state / delete_ipsec.
 
 NDMS 5.01 live rules (websun NC-1812):
 - Write FLAT object with required \"name\" field — NEVER nested site-to-site.{name}.
@@ -25,6 +26,7 @@ Runtime bring-up research (NDMS 5.01 / ipsec 6.0.1-6) — NOT FOUND:
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -372,7 +374,7 @@ def _s2s_flat_payload(
     ike_aead: bool = False,
     ike_encryption: str = "aes-cbc-256",
     ike_integrity: str = "sha256",
-    ike_prf: str = "sha256",
+    ike_prf: str | None = "sha256",
     ike_dh: str = "14",
     ike_lifetime: str = "86400",
     ipsec_aead: bool = False,
@@ -389,7 +391,10 @@ def _s2s_flat_payload(
     passive: bool = False,
     force_encaps: bool | None = True,
 ) -> dict[str, Any]:
-    """Build flat crypto.ipsec.site-to-site object (name field required; never nested)."""
+    """Build flat crypto.ipsec.site-to-site object (name field required; never nested).
+
+    ike_prf empty/None → field omitted (NDMS often stores ike-prf as \"\").
+    """
     if not name or not _NAME_RE.match(name):
         raise ValueError("name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
     if ike_protocol not in _IKE_PROTOCOLS:
@@ -415,7 +420,9 @@ def _s2s_flat_payload(
     _validate_proposal("ike_encryption", ike_encryption, enc_list)
     if not ike_aead:
         _validate_proposal("ike_integrity", ike_integrity, _IKE_INTEGRITY)
-    _validate_proposal("ike_prf", ike_prf, _IKE_PRF)
+    prf = None if ike_prf is None or str(ike_prf).strip() == "" else str(ike_prf).strip()
+    if prf is not None:
+        _validate_proposal("ike_prf", prf, _IKE_PRF)
     _validate_proposal("ike_dh", str(ike_dh), _DH_GROUPS)
     _validate_proposal("ipsec_encryption", ipsec_encryption, esp_list)
     if not ipsec_aead:
@@ -436,7 +443,6 @@ def _s2s_flat_payload(
         "ike-aead": bool(ike_aead),
         "ike-encryption": ike_encryption,
         "ike-integrity": ike_integrity,
-        "ike-prf": ike_prf,
         "ike-dh": str(ike_dh),
         "ike-lifetime": str(ike_lifetime).strip(),
         "ipsec-aead": bool(ipsec_aead),
@@ -452,9 +458,52 @@ def _s2s_flat_payload(
         "ike-mode": ike_mode,
         "ipsec-mode": ipsec_mode,
     }
+    if prf is not None:
+        payload["ike-prf"] = prf
     if force_encaps is not None:
         payload["force-encaps"] = bool(force_encaps)
     return payload
+
+
+def _rc_profile_to_kwargs(cfg: dict, *, name: str, ike_psk: str) -> dict[str, Any]:
+    """Map show/rc site-to-site dict → kwargs for _s2s_flat_payload (PSK in memory only)."""
+    prf_raw = cfg.get("ike-prf")
+    prf = "" if prf_raw in (None, "") else str(prf_raw)
+    return {
+        "name": name,
+        "peer": str(cfg.get("peer") or ""),
+        "ike_psk": ike_psk,
+        "local_id": str(cfg.get("ike-local-id") or ""),
+        "remote_id": str(cfg.get("ike-remote-id") or ""),
+        "local_networks": str(cfg.get("ipsec-local-networks") or ""),
+        "remote_networks": str(cfg.get("ipsec-remote-networks") or ""),
+        "ike_protocol": str(cfg.get("ike-protocol") or "ikev2"),
+        "local_id_type": str(cfg.get("ike-local-id-type") or "dn"),
+        "remote_id_type": str(cfg.get("ike-remote-id-type") or "dn"),
+        "ike_aead": bool(_as_bool(cfg.get("ike-aead")) or False),
+        "ike_encryption": str(cfg.get("ike-encryption") or "aes-cbc-256"),
+        "ike_integrity": str(cfg.get("ike-integrity") or "sha256"),
+        "ike_prf": prf,
+        "ike_dh": str(cfg.get("ike-dh") or "14"),
+        "ike_lifetime": str(cfg.get("ike-lifetime") or "86400"),
+        "ipsec_aead": bool(_as_bool(cfg.get("ipsec-aead")) or False),
+        "ipsec_encryption": str(cfg.get("ipsec-encryption") or "esp-aes-256"),
+        "ipsec_integrity": str(cfg.get("ipsec-integrity") or "esp-sha256-hmac"),
+        "ipsec_dh": str(cfg.get("ipsec-dh") or "14"),
+        "ipsec_lifetime": str(cfg.get("ipsec-lifetime") or "28800"),
+        "ike_mode": str(cfg.get("ike-mode") or "main"),
+        "ipsec_mode": str(cfg.get("ipsec-mode") or "tunnel"),
+        "dpd": bool(_as_bool(cfg.get("dpd")) if cfg.get("dpd") is not None else True),
+        "dpd_interval": str(cfg.get("dpd-interval") or "30"),
+        "nail_up": bool(_as_bool(cfg.get("nail-up")) if cfg.get("nail-up") is not None else True),
+        "autoconnect": bool(_as_bool(cfg.get("autoconnect")) if cfg.get("autoconnect") is not None else True),
+        "passive": bool(_as_bool(cfg.get("passive")) or False),
+        "force_encaps": (
+            _as_bool(cfg.get("force-encaps"))
+            if cfg.get("force-encaps") is not None
+            else True
+        ),
+    }
 
 
 async def _apply_s2s(client, payload: dict[str, Any]) -> Any:
@@ -599,22 +648,31 @@ def _parse_charon_status(ipsec_raw: Any, name: str) -> dict:
     if m:
         sa_summary = m.group(1).strip()
 
-    # Prefer per-connection CONNECTING/ESTABLISHED line for this name
-    ike_phase = "unknown"
     conn_re = re.compile(
         rf"(?im)^\s*{re.escape(name)}(?:\[\d+\])?:\s*(CONNECTING|ESTABLISHED|DELETING|PASSIVE)\b"
     )
-    phases = conn_re.findall(text)
+    phases = [p.upper() for p in conn_re.findall(text)]
+    ike_phase = "unknown"
     if phases:
-        # Prefer ESTABLISHED if any, else first seen
-        if any(p.upper() == "ESTABLISHED" for p in phases):
+        if "ESTABLISHED" in phases:
             ike_phase = "ESTABLISHED"
         else:
-            ike_phase = phases[0].upper()
-    elif sa_summary and "0 up" in sa_summary.lower() and "connecting" not in sa_summary.lower():
-        ike_phase = "none"
-    elif re.search(rf"(?i)\b{re.escape(name)}\b", text):
-        ike_phase = "unknown"
+            ike_phase = phases[0]
+    elif sa_summary:
+        counts = re.search(r"(\d+)\s+up\s*,\s*(\d+)\s+connecting", sa_summary, re.I)
+        if counts:
+            up_n, conn_n = int(counts.group(1)), int(counts.group(2))
+            if up_n == 0 and conn_n == 0:
+                # Name may still appear in Connections: config dump — that is not an SA.
+                ike_phase = "none"
+            elif conn_n > 0:
+                ike_phase = "CONNECTING"
+            elif up_n > 0:
+                ike_phase = "ESTABLISHED"
+            else:
+                ike_phase = "unknown"
+        else:
+            ike_phase = "unknown"
     else:
         ike_phase = "none"
 
@@ -626,9 +684,8 @@ def _parse_charon_status(ipsec_raw: Any, name: str) -> dict:
     if tm:
         tasks = tm.group(1).strip()
     else:
-        # alternate block form: "active: IKE_INIT ..."
         am = re.search(r"(?im)^\s*active:\s*(IKE_[A-Z0-9_ ]+)", text)
-        if am and re.search(rf"(?i)\b{re.escape(name)}\b", text):
+        if am and phases:
             tasks = am.group(1).strip()
 
     note = (
@@ -644,6 +701,63 @@ def _parse_charon_status(ipsec_raw: Any, name: str) -> dict:
             "ike_phase": ike_phase,
             "tasks_active": tasks,
             "note": note,
+        }.items()
+        if value is not None
+    }
+
+
+def _match_ike_nat_row(row: dict, peer: str, ports: set[int]) -> bool:
+    if str(row.get("protocol") or "").upper() not in ("UDP", "17"):
+        return False
+    addrs = {
+        str(row.get("src") or ""),
+        str(row.get("dst") or ""),
+        str(row.get("src-out") or ""),
+        str(row.get("dst-out") or ""),
+    }
+    if peer not in addrs:
+        return False
+    row_ports: set[int] = set()
+    for key in ("sport", "dport", "sport-out", "dport-out"):
+        val = row.get(key)
+        try:
+            row_ports.add(int(val))
+        except (TypeError, ValueError):
+            continue
+    return bool(row_ports & ports)
+
+
+def _ike_session_from_nat(row: dict) -> dict:
+    packets = int(row.get("packets") or 0)
+    packets_out = int(row.get("packets-out") or 0)
+    flags_raw = row.get("flags") or []
+    if isinstance(flags_raw, str):
+        flags = [flags_raw]
+    elif isinstance(flags_raw, list):
+        flags = [str(f) for f in flags_raw]
+    else:
+        flags = []
+    unreplied = packets_out == 0 and packets > 0
+    if unreplied and "UNREPLIED" not in flags:
+        flags = [*flags, "UNREPLIED"]
+    return {
+        key: value
+        for key, value in {
+            "protocol": "UDP",
+            "src": row.get("src"),
+            "dst": row.get("dst"),
+            "sport": row.get("sport"),
+            "dport": row.get("dport"),
+            "src_out": row.get("src-out"),
+            "dst_out": row.get("dst-out"),
+            "sport_out": row.get("sport-out"),
+            "dport_out": row.get("dport-out"),
+            "packets": packets,
+            "bytes": int(row.get("bytes") or 0),
+            "packets_reply": packets_out,
+            "bytes_reply": int(row.get("bytes-out") or 0),
+            "unreplied": unreplied,
+            "flags": flags or None,
         }.items()
         if value is not None
     }
@@ -799,11 +913,21 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
     if crypto_empty and runtime.get("enabled"):
         warnings.append("show/crypto is empty while map enabled — engine has no live SA dump")
 
+    ike_path = None
+    peer_addr = str(cfg.get("peer") or runtime.get("remote_peer") or "")
+    if peer_addr and peer_addr != "any":
+        try:
+            async with _get_client() as client:
+                ike_path = await _collect_ike_conntrack(client, peer=peer_addr)
+        except Exception as exc:  # noqa: BLE001
+            ike_path = {"ok": False, "error": str(exc).split("\n")[0][:200]}
+
     return _redact({
         "ok": True,
         "id": conn_name,
         "runtime": runtime,
         "charon": charon,
+        "ike_path": {"conntrack": ike_path} if ike_path is not None else None,
         "profile": {
             "peer": cfg.get("peer"),
             "passive": _as_bool(cfg.get("passive")),
@@ -832,6 +956,38 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
             "Re-run get_ipsec_runtime / show_ipsec_sa; on VPS check swanctl --list-sas / tcpdump",
         ],
     })
+
+
+async def _collect_ike_conntrack(
+    client,
+    *,
+    peer: str,
+    ports: list[int] | None = None,
+) -> dict:
+    ports_set = {int(p) for p in (ports or [500, 4500])}
+    nat = await client.rci_get("show/ip/nat")
+    rows = nat if isinstance(nat, list) else []
+    sessions = []
+    for row in rows:
+        if isinstance(row, dict) and _match_ike_nat_row(row, peer, ports_set):
+            sessions.append(_ike_session_from_nat(row))
+    udp500 = [s for s in sessions if int(s.get("dport") or 0) == 500 or int(s.get("sport") or 0) == 500
+              or int(s.get("dport_out") or 0) == 500 or int(s.get("sport_out") or 0) == 500]
+    udp4500 = [s for s in sessions if int(s.get("dport") or 0) == 4500 or int(s.get("sport") or 0) == 4500
+               or int(s.get("dport_out") or 0) == 4500 or int(s.get("sport_out") or 0) == 4500]
+    return {
+        "ok": True,
+        "peer": peer,
+        "ports": sorted(ports_set),
+        "sessions": sessions,
+        "count": len(sessions),
+        "summary": {
+            "udp500_out": any(int(s.get("packets") or 0) > 0 for s in udp500),
+            "udp500_reply": any(int(s.get("packets_reply") or 0) > 0 for s in udp500),
+            "udp4500_out": any(int(s.get("packets") or 0) > 0 for s in udp4500),
+            "udp4500_reply": any(int(s.get("packets_reply") or 0) > 0 for s in udp4500),
+        },
+    }
 
 async def _save_config(client) -> Any:
     resp = await client.rci({"system": {"configuration": {"save": {}}}})
@@ -1078,12 +1234,14 @@ async def show_crypto() -> dict:
 
 async def create_ipsec_s2s(
     name: str,
-    peer: str,
-    ike_psk: str,
-    local_id: str,
-    remote_id: str,
-    local_networks: str | list[str],
-    remote_networks: str | list[str],
+    peer: str = "",
+    ike_psk: str = "",
+    local_id: str = "",
+    remote_id: str = "",
+    local_networks: str | list[str] = "",
+    remote_networks: str | list[str] = "",
+    source_name: str = "",
+    keep_psk: bool = True,
     ike_protocol: str = "ikev2",
     local_id_type: str = "dn",
     remote_id_type: str = "dn",
@@ -1112,53 +1270,80 @@ async def create_ipsec_s2s(
 ) -> dict:
     """Create or update one IPsec S2S profile (idempotent by name). Requires confirm=true.
 
-    NDMS 5.01: POST flat crypto.ipsec.site-to-site with \"name\" field (NOT nested
-    site-to-site.{name}). Always sends full field set including lifetimes.
-    Enable via parse \"crypto map {name} enable\" — never site-to-site.enable JSON.
-    Verify show/rc before save; show/sc is stale until save.
-    Known quirks: ike-prf may stay empty in RC; force-encaps may be omitted (NAT-T
-    limitation — verify path with show/crypto/map if behind double-NAT).
-    PSK is input-only and never returned (has_psk only).
-    Does not touch WireGuard/ZeroTier/DNS/routes/firewall.
+    If source_name is set, missing fields (and PSK when keep_psk) are copied from that
+    profile in show/rc — ike_psk is then optional. PSK is never returned.
+    ike_prf=\"\" omits the field (NDMS often stores empty prf).
     """
     assert_writable()
     _require_confirm(confirm)
     try:
-        payload = _s2s_flat_payload(
-            name=name.strip(),
-            peer=peer,
-            ike_psk=ike_psk,
-            local_id=local_id,
-            remote_id=remote_id,
-            local_networks=local_networks,
-            remote_networks=remote_networks,
-            ike_protocol=ike_protocol,
-            local_id_type=local_id_type,
-            remote_id_type=remote_id_type,
-            ike_aead=ike_aead,
-            ike_encryption=ike_encryption,
-            ike_integrity=ike_integrity,
-            ike_prf=ike_prf,
-            ike_dh=ike_dh,
-            ike_lifetime=ike_lifetime,
-            ipsec_aead=ipsec_aead,
-            ipsec_encryption=ipsec_encryption,
-            ipsec_integrity=ipsec_integrity,
-            ipsec_dh=ipsec_dh,
-            ipsec_lifetime=ipsec_lifetime,
-            ike_mode=ike_mode,
-            ipsec_mode=ipsec_mode,
-            dpd=dpd,
-            dpd_interval=dpd_interval,
-            nail_up=nail_up,
-            autoconnect=autoconnect,
-            passive=passive,
-            force_encaps=force_encaps,
-        )
-        conn_name = payload["name"]
         async with _get_client() as client:
-            before = await _load_rc_connections(client)
-            existed = conn_name in before
+            rc_all = await _load_rc_connections(client)
+            src = source_name.strip()
+            kwargs: dict[str, Any]
+            if src:
+                if src not in rc_all:
+                    return {
+                        "ok": False,
+                        "error": "source not found",
+                        "source_name": src,
+                        "available_ids": sorted(rc_all.keys()),
+                    }
+                psk = ike_psk
+                if not psk:
+                    if keep_psk:
+                        psk = str(rc_all[src].get("ike-psk") or "")
+                    if not psk:
+                        raise ValueError("ike_psk required (source has no PSK or keep_psk=False)")
+                kwargs = _rc_profile_to_kwargs(rc_all[src], name=name.strip(), ike_psk=psk)
+                # identity / TS overrides only — keep source proposals (incl. empty ike-prf)
+                if peer != "":
+                    kwargs["peer"] = peer
+                if local_id:
+                    kwargs["local_id"] = local_id
+                if remote_id:
+                    kwargs["remote_id"] = remote_id
+                if local_networks not in ("", [], None):
+                    kwargs["local_networks"] = local_networks
+                if remote_networks not in ("", [], None):
+                    kwargs["remote_networks"] = remote_networks
+            else:
+                if not ike_psk:
+                    raise ValueError("ike_psk is required unless source_name is set")
+                kwargs = {
+                    "name": name.strip(),
+                    "peer": peer,
+                    "ike_psk": ike_psk,
+                    "local_id": local_id,
+                    "remote_id": remote_id,
+                    "local_networks": local_networks,
+                    "remote_networks": remote_networks,
+                    "ike_protocol": ike_protocol,
+                    "local_id_type": local_id_type,
+                    "remote_id_type": remote_id_type,
+                    "ike_aead": ike_aead,
+                    "ike_encryption": ike_encryption,
+                    "ike_integrity": ike_integrity,
+                    "ike_prf": ike_prf,
+                    "ike_dh": ike_dh,
+                    "ike_lifetime": ike_lifetime,
+                    "ipsec_aead": ipsec_aead,
+                    "ipsec_encryption": ipsec_encryption,
+                    "ipsec_integrity": ipsec_integrity,
+                    "ipsec_dh": ipsec_dh,
+                    "ipsec_lifetime": ipsec_lifetime,
+                    "ike_mode": ike_mode,
+                    "ipsec_mode": ipsec_mode,
+                    "dpd": dpd,
+                    "dpd_interval": dpd_interval,
+                    "nail_up": nail_up,
+                    "autoconnect": autoconnect,
+                    "passive": passive,
+                    "force_encaps": force_encaps,
+                }
+            payload = _s2s_flat_payload(**kwargs)
+            conn_name = payload["name"]
+            existed = conn_name in rc_all
             await _apply_s2s(client, payload)
             rc_after = await _load_rc_connections(client)
             if conn_name not in rc_after:
@@ -1172,17 +1357,17 @@ async def create_ipsec_s2s(
             sc, statuses = await _load_connections(client)
             if saved and conn_name not in sc:
                 warnings.append("saved but profile missing from show/sc")
-            status_entry = statuses.get(conn_name)
             summary = _connection_summary_safe(
                 conn_name,
                 sc.get(conn_name) or rc_after[conn_name],
-                status_entry,
+                statuses.get(conn_name),
             )
         return _redact({
             **summary,
             "action": "updated" if existed else "created",
             "saved": saved,
             "enabled": enable,
+            "source_name": src or None,
             "warnings": warnings,
             "rci_notes": {
                 "write": "flat crypto.ipsec.site-to-site with name field",
@@ -1267,7 +1452,9 @@ async def update_ipsec_s2s(
                 "ike_aead": ike_aead if ike_aead is not None else bool(_as_bool(cur.get("ike-aead")) or False),
                 "ike_encryption": ike_encryption if ike_encryption is not None else str(cur.get("ike-encryption") or "aes-cbc-256"),
                 "ike_integrity": ike_integrity if ike_integrity is not None else str(cur.get("ike-integrity") or "sha256"),
-                "ike_prf": ike_prf if ike_prf is not None else (str(cur.get("ike-prf") or "sha256") or "sha256"),
+                "ike_prf": ike_prf if ike_prf is not None else (
+                    "" if cur.get("ike-prf") in (None, "") else str(cur.get("ike-prf"))
+                ),
                 "ike_dh": ike_dh if ike_dh is not None else str(cur.get("ike-dh") or "14"),
                 "ike_lifetime": ike_lifetime if ike_lifetime is not None else str(cur.get("ike-lifetime") or "86400"),
                 "ipsec_aead": ipsec_aead if ipsec_aead is not None else bool(_as_bool(cur.get("ipsec-aead")) or False),
@@ -1403,7 +1590,6 @@ async def delete_ipsec(
                 saved = True
             sc, statuses = await _load_connections(client)
             if conn_name in sc or conn_name in statuses:
-                # map entry may linger briefly; warn if still in saved config after save
                 if saved and conn_name in sc:
                     raise RuntimeError(f"IPsec profile still in show/sc after save: {conn_name}")
         return _redact({
@@ -1415,17 +1601,211 @@ async def delete_ipsec(
         raise type(exc)(_sanitize_error(exc)) from None
 
 
+async def rename_ipsec(
+    old_name: str,
+    new_name: str,
+    save: bool = True,
+    confirm: bool = False,
+) -> dict:
+    """Rename IPsec S2S by clone+delete using PSK only in memory. Requires confirm=true.
+
+    Does not accept ike_psk from the agent — reads raw PSK from show/rc for old_name.
+    Never returns PSK. Does not touch WG/ZT/DNS/firewall/routes.
+    """
+    assert_writable()
+    _require_confirm(confirm)
+    old_id = old_name.strip()
+    new_id = new_name.strip()
+    if not old_id or not new_id:
+        raise ValueError("old_name and new_name are required")
+    if old_id == new_id:
+        raise ValueError("old_name and new_name must differ")
+    if not _NAME_RE.match(new_id):
+        raise ValueError("new_name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+    try:
+        async with _get_client() as client:
+            rc = await _load_rc_connections(client)
+            available = sorted(rc.keys())
+            if old_id not in rc:
+                return {"ok": False, "error": "not found", "id": old_id, "available_ids": available}
+            if new_id in rc:
+                return {
+                    "ok": False,
+                    "error": "new_name already exists",
+                    "id": new_id,
+                    "available_ids": available,
+                }
+            psk = str(rc[old_id].get("ike-psk") or "")
+            if not psk:
+                raise ValueError(f"source {old_id} has no ike-psk in show/rc")
+            was_enabled = True
+            try:
+                statuses = _normalize_status_map(await client.rci_get(_RCI_PATHS["status_map"]))
+                was_enabled = _as_bool((statuses.get(old_id) or {}).get("config", {}).get("enabled"))
+                if was_enabled is None:
+                    was_enabled = True
+            except Exception:  # noqa: BLE001
+                was_enabled = True
+
+            payload = _s2s_flat_payload(**_rc_profile_to_kwargs(rc[old_id], name=new_id, ike_psk=psk))
+            created = False
+            try:
+                await _apply_s2s(client, payload)
+                created = True
+                rc_mid = await _load_rc_connections(client)
+                if new_id not in rc_mid:
+                    raise RuntimeError(f"rename: {new_id} missing in show/rc after create")
+                await _set_map_enabled(client, new_id, bool(was_enabled))
+                del_resp = await client.rci([{
+                    "crypto": {"ipsec": {"site-to-site": {"name": old_id, "no": True}}},
+                }])
+                _raise_on_rci_errors(del_resp)
+                rc_after = await _load_rc_connections(client)
+                if old_id in rc_after:
+                    raise RuntimeError(f"rename: {old_id} still present after delete")
+                if new_id not in rc_after:
+                    raise RuntimeError(f"rename: {new_id} missing after delete of old")
+                saved = False
+                if save:
+                    await _save_config(client)
+                    saved = True
+                sc, statuses = await _load_connections(client)
+                summary = _connection_summary_safe(
+                    new_id,
+                    sc.get(new_id) or rc_after[new_id],
+                    statuses.get(new_id),
+                )
+            except Exception as exc:
+                # best-effort rollback: if new created and old still exists, drop new
+                partial = {"partial": True, "created_new": created, "error": _sanitize_error(exc)}
+                try:
+                    now = await _load_rc_connections(client)
+                    if created and new_id in now and old_id in now:
+                        await client.rci([{
+                            "crypto": {"ipsec": {"site-to-site": {"name": new_id, "no": True}}},
+                        }])
+                        partial["rolled_back_new"] = True
+                except Exception:  # noqa: BLE001
+                    partial["rolled_back_new"] = False
+                raise RuntimeError(json.dumps(partial, ensure_ascii=False)) from None
+
+        return _redact({
+            **summary,
+            "renamed": True,
+            "old_id": old_id,
+            "id": new_id,
+            "saved": saved,
+            "has_psk": True,
+        })
+    except Exception as exc:  # noqa: BLE001
+        raise type(exc)(_sanitize_error(exc)) from None
+
+
+async def clone_ipsec(
+    source_name: str,
+    new_name: str,
+    peer: str = "",
+    local_id: str = "",
+    remote_id: str = "",
+    local_networks: str | list[str] = "",
+    remote_networks: str | list[str] = "",
+    enable: bool = True,
+    save: bool = True,
+    confirm: bool = False,
+) -> dict:
+    """Clone IPsec S2S profile (PSK copied in memory only). Requires confirm=true.
+
+    Equivalent to create_ipsec_s2s(source_name=…, keep_psk=true) without agent-supplied PSK.
+    """
+    return await create_ipsec_s2s(
+        name=new_name,
+        source_name=source_name,
+        keep_psk=True,
+        peer=peer,
+        local_id=local_id,
+        remote_id=remote_id,
+        local_networks=local_networks,
+        remote_networks=remote_networks,
+        enable=enable,
+        save=save,
+        confirm=confirm,
+    )
+
+
+async def get_ike_conntrack(
+    peer: str = "",
+    name: str = "",
+    ports: list[int] | None = None,
+) -> dict:
+    """Read-only filter of show/ip/nat for IKE UDP/500|4500 to a peer (no full dump)."""
+    peer_addr = peer.strip()
+    async with _get_client() as client:
+        if not peer_addr:
+            if not name.strip():
+                raise ValueError("peer or name is required")
+            rc = await _load_rc_connections(client)
+            cfg = rc.get(name.strip()) or {}
+            peer_addr = str(cfg.get("peer") or "")
+            if not peer_addr or peer_addr == "any":
+                statuses = _normalize_status_map(await client.rci_get(_RCI_PATHS["status_map"]))
+                peer_addr = str(
+                    ((statuses.get(name.strip()) or {}).get("config") or {}).get("remote_peer") or ""
+                )
+            if not peer_addr:
+                return {
+                    "ok": False,
+                    "error": "peer not found for name",
+                    "id": name.strip(),
+                    "available_ids": sorted(rc.keys()),
+                }
+        return await _collect_ike_conntrack(client, peer=peer_addr, ports=ports)
+
+
+async def get_packet_capture_status() -> dict:
+    """Read-only: whether NDMS monitor/capture is available (does not install components)."""
+    async with _get_client() as client:
+        version = await client.rci_get("show/version")
+        installed = {
+            part.strip()
+            for part in str((version.get("ndw") or {}).get("components") or "").split(",")
+            if part.strip()
+        }
+        monitor_installed = "monitor" in installed
+        capture_paths = []
+        for path in ("show/monitor", "show/capture", "show/packet-capture"):
+            try:
+                await client.rci_get(path)
+                capture_paths.append(path)
+            except Exception:  # noqa: BLE001
+                continue
+    available = monitor_installed and bool(capture_paths)
+    return {
+        "monitor_installed": monitor_installed,
+        "capture_available": available,
+        "capture_paths": capture_paths or None,
+        "message": (
+            "Packet capture available"
+            if available
+            else "Packet capture недоступен без установки компонента monitor"
+        ),
+    }
+
+
 def register(mcp) -> None:
     mcp.tool()(list_ipsec)
     mcp.tool()(list_ipsec_connections)
     mcp.tool()(get_ipsec)
     mcp.tool()(get_ipsec_runtime)
     mcp.tool()(diagnose_ipsec_bringup)
+    mcp.tool()(get_ike_conntrack)
+    mcp.tool()(get_packet_capture_status)
     mcp.tool()(list_ipsec_proposals)
     mcp.tool()(show_ipsec_sa)
     mcp.tool()(show_ipsec)
     mcp.tool()(show_crypto)
     mcp.tool()(create_ipsec_s2s)
     mcp.tool()(update_ipsec_s2s)
+    mcp.tool()(clone_ipsec)
+    mcp.tool()(rename_ipsec)
     mcp.tool()(set_ipsec_state)
     mcp.tool()(delete_ipsec)
