@@ -1783,36 +1783,6 @@ async def get_ike_conntrack(
         return await _collect_ike_conntrack(client, peer=peer_addr, ports=ports)
 
 
-async def get_packet_capture_status() -> dict:
-    """Read-only: whether NDMS monitor/capture is available (does not install components)."""
-    async with _get_client() as client:
-        version = await client.rci_get("show/version")
-        installed = {
-            part.strip()
-            for part in str((version.get("ndw") or {}).get("components") or "").split(",")
-            if part.strip()
-        }
-        monitor_installed = "monitor" in installed
-        capture_paths = []
-        for path in ("show/monitor", "show/capture", "show/packet-capture"):
-            try:
-                await client.rci_get(path)
-                capture_paths.append(path)
-            except Exception:  # noqa: BLE001
-                continue
-    available = monitor_installed and bool(capture_paths)
-    return {
-        "monitor_installed": monitor_installed,
-        "capture_available": available,
-        "capture_paths": capture_paths or None,
-        "message": (
-            "Packet capture available"
-            if available
-            else "Packet capture недоступен без установки компонента monitor"
-        ),
-    }
-
-
 def register(mcp) -> None:
     mcp.tool()(list_ipsec)
     mcp.tool()(list_ipsec_connections)
@@ -1820,7 +1790,6 @@ def register(mcp) -> None:
     mcp.tool()(get_ipsec_runtime)
     mcp.tool()(diagnose_ipsec_bringup)
     mcp.tool()(get_ike_conntrack)
-    mcp.tool()(get_packet_capture_status)
     mcp.tool()(list_ipsec_proposals)
     mcp.tool()(show_ipsec_sa)
     mcp.tool()(show_ipsec)

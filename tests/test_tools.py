@@ -2,6 +2,7 @@
 
 import httpx
 import pytest
+from unittest.mock import AsyncMock
 
 from netcraze_mcp.client import _sanitize_error
 from netcraze_mcp.config import configure
@@ -1133,18 +1134,146 @@ async def test_clone_ipsec_no_psk_in_response(mock_client):
 
 
 async def test_packet_capture_status_without_monitor(mock_client):
-    from netcraze_mcp.tools.ipsec import get_packet_capture_status
+    from netcraze_mcp.tools.capture import get_packet_capture_status
 
     async def rci_get(path):
         if path == "show/version":
             return {"ndw": {"components": "usb,storage,ipsec"}}
         raise RuntimeError(f"404 {path}")
 
+    async def rci(payload):
+        raise RuntimeError("monitor unavailable")
+
     mock_client.rci_get.side_effect = rci_get
+    mock_client.rci.side_effect = rci
     result = await get_packet_capture_status()
     assert result["monitor_installed"] is False
     assert result["capture_available"] is False
+    assert result["capture_running"] is False
     assert "monitor" in result["message"]
+    assert "start" in result["rci_paths"]
+
+
+async def test_start_stop_download_packet_capture(mock_client):
+    import gzip
+    import struct
+    from netcraze_mcp.tools.capture import (
+        start_packet_capture,
+        stop_packet_capture,
+        download_packet_capture,
+        delete_packet_capture,
+        list_packet_captures,
+    )
+
+    # minimal pcap with one UDP 500→500
+    def make_pcap() -> bytes:
+        gh = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+        # eth + ip + udp
+        eth = bytes(12) + struct.pack("!H", 0x0800)
+        ip = bytearray(20)
+        ip[0] = 0x45
+        ip[9] = 17
+        ip[12:16] = bytes([192, 168, 0, 16])
+        ip[16:20] = bytes([45, 89, 63, 73])
+        udp = struct.pack("!HHHH", 500, 500, 8, 0)
+        pkt = bytes(eth) + bytes(ip) + udp
+        ph = struct.pack("<IIII", 0, 0, len(pkt), len(pkt))
+        return gh + ph + pkt
+
+    state = {"running": False, "created": False, "cmds": []}
+
+    async def rci_get(path):
+        if path == "show/version":
+            return {"ndw": {"components": "monitor,ipsec"}}
+        if path == "show/interface":
+            return {"GigabitEthernet1": {"id": "GigabitEthernet1"}}
+        return {}
+
+    async def rci(payload):
+        if isinstance(payload, dict) and "parse" in payload:
+            cmd = payload["parse"]
+            state["cmds"].append(cmd)
+            if cmd.startswith("monitor capture interface") and "enable" not in cmd and not cmd.startswith("no "):
+                if "filter" in cmd or "buffer" in cmd or "capture-size" in cmd or "direction" in cmd:
+                    return {"parse": {"status": [{"status": "message", "message": "ok"}]}}
+                state["created"] = True
+                return {"parse": {"status": [{"status": "message", "message": "created"}]}}
+            if cmd.endswith(" enable") and not cmd.startswith("no "):
+                state["running"] = True
+                return {"parse": {"status": [{"status": "message", "message": "started"}]}}
+            if cmd.startswith("no monitor capture interface") and cmd.endswith(" enable"):
+                state["running"] = False
+                return {"parse": {"status": [{"status": "message", "message": "disabled"}]}}
+            if cmd.startswith("no monitor capture interface"):
+                state["created"] = False
+                return {"parse": {"status": [{"status": "message", "message": "removed"}]}}
+            return {"parse": {"status": [{"status": "message", "message": "ok"}]}}
+        if "rc" in str(payload):
+            if not state["created"]:
+                return {"show": {"rc": {"monitor": {}}}}
+            return {"show": {"rc": {"monitor": {"capture": {"interface": {
+                "GigabitEthernet1": {
+                    "direction": "out",
+                    "filter": {"bpf-program": "udp port 500 or udp port 4500"},
+                }
+            }}}}}}
+        if "status" in str(payload):
+            if not state["created"]:
+                return {"show": {"monitor": {"capture": {"interface": {"status": {
+                    "status": [{"status": "error", "message": "not found"}]
+                }}}}}}
+            entry = {
+                "id": "GigabitEthernet1",
+                "capture-file": "" if state["running"] else "temp:/run/monitor/x.pcap",
+                "statistics": {
+                    "frames-captured": 1,
+                    "bytes-captured": 50,
+                    "started": state["running"],
+                    "file": "" if state["running"] else "temp:/run/monitor/x.stats",
+                },
+            }
+            return {"show": {"monitor": {"capture": {"interface": {"status": {
+                "monitor": {"capture": {"interface": {"GigabitEthernet1": entry}}}
+            }}}}}}
+        return {}
+
+    mock_client.rci_get.side_effect = rci_get
+    mock_client.rci.side_effect = rci
+    from unittest.mock import AsyncMock as _AsyncMock
+    mock_client.ci_get_bytes = _AsyncMock(return_value=gzip.compress(make_pcap()))
+
+    started = await start_packet_capture(
+        interface="GigabitEthernet1",
+        filter_preset="ike",
+        confirm=True,
+    )
+    assert started["ok"] is True
+    assert started["running"] is True
+    assert "udp port 500" in started["filter"]
+    assert any(c.endswith(" enable") and not c.startswith("no ") for c in state["cmds"])
+
+    stopped = await stop_packet_capture(id="GigabitEthernet1", confirm=True)
+    assert stopped["stopped"] is True
+    assert stopped["running"] is False
+
+    summary = await download_packet_capture(id="GigabitEthernet1", format="summary")
+    assert summary["ok"] is True
+    assert summary["packets_total"] >= 1
+    assert summary["ike_summary"]["udp500_tx"] >= 1
+
+    listed = await list_packet_captures()
+    assert listed["ok"] is True
+    assert listed["count"] == 1
+
+    deleted = await delete_packet_capture(id="GigabitEthernet1", confirm=True)
+    assert deleted["deleted"] is True
+
+
+async def test_start_packet_capture_requires_confirm(mock_client):
+    from netcraze_mcp.tools.capture import start_packet_capture
+    mock_client.rci_get.return_value = {"ndw": {"components": "monitor"}}
+    with pytest.raises(PermissionError):
+        await start_packet_capture(interface="GigabitEthernet1", filter_preset="ike", confirm=False)
 
 
 # ─── components / firmware / storage ──────────────────────────────────────────
@@ -1359,7 +1488,7 @@ async def test_list_printers_dict_map(mock_client):
 
 
 async def test_install_component_queues_and_commits(mock_client):
-    result = await install_component("ftp", commit=True)
+    result = await install_component("ftp", commit=True, confirm=True)
     assert result == {"queued": True, "name": "ftp", "action": "install", "committed": True}
     assert mock_client.rci.call_args_list[0].args[0] == {"parse": "components install ftp"}
     assert mock_client.rci.call_args_list[1].args[0] == {"parse": "components commit"}
@@ -1368,11 +1497,16 @@ async def test_install_component_queues_and_commits(mock_client):
 async def test_install_component_safe_mode(mock_client):
     configure(safe_mode=True)
     with pytest.raises(PermissionError):
-        await install_component("ftp")
+        await install_component("ftp", confirm=True)
+
+
+async def test_install_component_requires_confirm(mock_client):
+    with pytest.raises(PermissionError):
+        await install_component("ftp", confirm=False)
 
 
 async def test_remove_component_without_commit(mock_client):
-    result = await remove_component("ftp", commit=False)
+    result = await remove_component("ftp", commit=False, confirm=True)
     assert result["committed"] is False
     mock_client.rci.assert_called_once_with({"parse": "components remove ftp"})
 

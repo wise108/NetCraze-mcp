@@ -148,9 +148,15 @@ async def get_firmware_info() -> dict:
     }
 
 
-async def install_component(name: str, commit: bool = True) -> dict:
-    """Queue NDMS component for install; optionally run components commit."""
+async def install_component(name: str, commit: bool = True, confirm: bool = False) -> dict:
+    """Queue NDMS component for install; optionally run components commit.
+
+    Requires confirm=true. Install does not start packet capture — after installing
+    ``monitor``, call get_packet_capture_status / start_packet_capture separately.
+    """
     assert_writable()
+    if not confirm:
+        raise PermissionError("confirm=true is required for install_component")
     if not name.strip():
         raise ValueError("Component name is required")
     async with _get_client() as client:
@@ -164,9 +170,11 @@ async def install_component(name: str, commit: bool = True) -> dict:
     return {"queued": True, "name": name.strip(), "action": "install", "committed": committed}
 
 
-async def remove_component(name: str, commit: bool = True) -> dict:
-    """Queue NDMS component for removal; optionally run components commit."""
+async def remove_component(name: str, commit: bool = True, confirm: bool = False) -> dict:
+    """Queue NDMS component for removal; optionally run components commit. Requires confirm=true."""
     assert_writable()
+    if not confirm:
+        raise PermissionError("confirm=true is required for remove_component")
     if not name.strip():
         raise ValueError("Component name is required")
     async with _get_client() as client:

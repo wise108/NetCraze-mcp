@@ -130,6 +130,20 @@ create_ipsec_s2s(
 - `crypto map X disable` не существует → используем `no crypto map X enable`
 - PSK никогда не возвращается (`has_psk` only); нужен `confirm=true` + writable (не safe-mode)
 
+### Packet capture / monitor (0.12.0)
+
+| Инструмент | Описание |
+|---|---|
+| `get_packet_capture_status` | monitor installed / available / running + rci_paths |
+| `list_packet_captures` / `get_packet_capture` | инстансы по интерфейсу |
+| `ensure_packet_capture` | install `monitor` при confirm (не стартует capture) |
+| `start_packet_capture` | create+filter+enable; `filter_preset=ike` → udp/500|4500 |
+| `stop_packet_capture` | `no … enable` |
+| `download_packet_capture` | summary (pcap parse) или pcap на диск via `/ci/temp:…` |
+| `delete_packet_capture` | удалить instance |
+
+NDMS: start=`enable`, stop=`no enable`; BPF в кавычках; pcap часто gzip.
+
 ### IPsec runtime bring-up (0.11.0 / hotfix 0.11.1 / 0.11.2)
 
 | Инструмент | Описание |
@@ -142,6 +156,8 @@ create_ipsec_s2s(
 | `clone_ipsec` / `create_ipsec_s2s(source_name=…)` | Clone с `keep_psk`; `ike_psk` не required |
 
 **0.11.1:** `get_running_config_redacted` redact’ит `crypto ike key …`; runtime endpoints одинаковы в diagnose/get; diagnose не врёт «IKE не стартовал», если charon CONNECTING.
+
+**0.12.0:** packet capture lifecycle (monitor enable/no enable + /ci/temp pcap).
 
 **0.11.3:** diagnose warnings согласованы с conntrack; clone/rename не шлют force-encaps если absent у source.
 

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import netcraze_mcp.config as config
 import netcraze_mcp.tools.backup as backup_tools
+import netcraze_mcp.tools.capture as capture_tools
 import netcraze_mcp.tools.components as components_tools
 import netcraze_mcp.tools.diagnostics as diagnostics_tools
 import netcraze_mcp.tools.dns_routes as dns_routes_tools
@@ -59,6 +60,7 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
     for module in (
         system_tools,
         backup_tools,
+        capture_tools,
         components_tools,
         network_tools,
         dns_routes_tools,

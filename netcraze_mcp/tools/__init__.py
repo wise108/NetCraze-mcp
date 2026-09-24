@@ -2,6 +2,7 @@
 
 from . import (
     backup,
+    capture,
     components,
     diagnostics,
     dns_routes,
@@ -35,6 +36,7 @@ def register_tools(mcp) -> None:
     storage.register(mcp)
     wireguard.register(mcp)
     ipsec.register(mcp)
+    capture.register(mcp)
     zerotier.register(mcp)
     vpn.register(mcp)
     policy.register(mcp)
