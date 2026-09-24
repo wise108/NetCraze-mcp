@@ -1,15 +1,26 @@
 """IPsec site-to-site tools (NDMS crypto map / site-to-site).
 
-Read-only: list/get/proposals/show.
+Read-only: list/get/proposals/show/runtime/diagnose.
 Write: create_ipsec_s2s / update_ipsec_s2s / set_ipsec_state / delete_ipsec.
 
 NDMS 5.01 live rules (websun NC-1812):
 - Write FLAT object with required \"name\" field — NEVER nested site-to-site.{name}.
 - Do NOT enable via site-to-site.enable JSON (resets peer/autoconnect/…); use
-  parse \"crypto map {name} enable\" / \"no crypto map {name} enable\".
+  parse \"crypto map {name} enable\" / \"no crypto map {name} enable\"
+  (UI equivalent: POST crypto.map.{name}.enable + service.ipsec=true).
 - Verify with show/rc before save; show/sc is stale until save.
 - ike-prf may stay empty in RC; force-encaps may be omitted from RC after set.
 - Delete: flat {\"name\": …, \"no\": true} → \"removed crypto map.\"
+
+Runtime bring-up research (NDMS 5.01 / ipsec 6.0.1-6) — NOT FOUND:
+- UI has enable toggle only (no Connect button). Status when enabled+UNDEFINED = NO_LINK.
+- parse \"crypto map X connect\" / crypto.map.{X}.connect=true → message
+  \"enable autoconnection\" (config flag map.connect ≈ site-to-site.autoconnect),
+  NOT IKE_SA_INIT. ike_state stays UNDEFINED without peer response / interesting traffic.
+- nail-up → \"active renegotiation\" (hold after SA); not first initiate.
+- No CLI: initiate / start / up / clear crypto sa.
+- Therefore connect_ipsec/disconnect_ipsec are NOT published as fake endpoints.
+  Use diagnose_ipsec_bringup + interesting traffic / remote initiator.
 """
 
 from __future__ import annotations
@@ -60,10 +71,13 @@ _RCI_PATHS = {
     "connections": "show/sc/crypto/ipsec/site-to-site",
     "connections_rc": "show/rc/crypto/ipsec/site-to-site",
     "status_map": "show/crypto/map",
+    "map_rc": "show/rc/crypto/map",
+    "map_sc": "show/sc/crypto/map",
     "crypto": "show/crypto",
     "ipsec": "show/ipsec",
     "crypto_engine": "show/sc/crypto",
     "sa_legacy": "show/crypto/ipsec/sa",
+    "service": "service",
 }
 
 _ID_TYPES = frozenset({"dn", "address", "fqdn", "email"})
@@ -451,7 +465,12 @@ async def _apply_s2s(client, payload: dict[str, Any]) -> Any:
 
 
 async def _set_map_enabled(client, name: str, enabled: bool) -> Any:
-    """Enable/disable crypto map via CLI parse — NOT via site-to-site.enable JSON."""
+    """Enable/disable crypto map via CLI parse — NOT via site-to-site.enable JSON.
+
+    Matches Keenetic UI intent (enable map). UI also POSTs crypto.map.{name}.enable
+    + service.ipsec=true; we use parse enable/disable and ensure service.ipsec on enable.
+    NOTE: enable ≠ IKE_SA_INIT on NDMS 5.01 (see module docstring / diagnose_ipsec_bringup).
+    """
     if enabled:
         cmd = f"crypto map {name} enable"
     else:
@@ -460,8 +479,248 @@ async def _set_map_enabled(client, name: str, enabled: bool) -> Any:
         cmd = f"no crypto map {name} enable"
     resp = await client.rci({"parse": cmd})
     _raise_on_rci_errors(resp)
+    if enabled:
+        # UI toggleConfiguration also enables the ipsec system service
+        svc = await client.rci({"service": {"ipsec": True}})
+        _raise_on_rci_errors(svc)
     return resp
 
+
+def _runtime_from_map_entry(name: str, entry: dict | None, map_cfg: dict | None = None) -> dict:
+    """Normalize one show/crypto/map entry (+ optional show/rc/crypto/map flags)."""
+    entry = entry if isinstance(entry, dict) else {}
+    config = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+    status = entry.get("status") if isinstance(entry.get("status"), dict) else {}
+    enabled = _as_bool(config.get("enabled"))
+    phase_state = status.get("state")
+    ike_state = status.get("ike_state")
+    connected = phase_state == "PHASE2_ESTABLISHED"
+    # UI labels: enabled+UNDEFINED → NO_LINK; else STANDING_BY; disabled → DOWN
+    if enabled is False:
+        ui_status = "DOWN"
+    elif connected:
+        ui_status = "CONNECTED"
+    elif ike_state == "UNDEFINED":
+        ui_status = "NO_LINK"
+    elif enabled:
+        ui_status = "STANDING_BY"
+    else:
+        ui_status = "UNKNOWN"
+    map_flags = {}
+    if isinstance(map_cfg, dict):
+        map_flags = {
+            key: value
+            for key, value in {
+                "map_connect": _as_bool(map_cfg.get("connect")),
+                "map_nail_up": _as_bool(map_cfg.get("nail-up")),
+                "map_enable": _as_bool(map_cfg.get("enable")),
+                "map_reauth_passive": _as_bool(map_cfg.get("reauth-passive")),
+            }.items()
+            if value is not None
+        }
+    phase1 = status.get("phase1") if isinstance(status.get("phase1"), dict) else None
+    phase2 = []
+    phase2_sa_list = status.get("phase2_sa_list")
+    if isinstance(phase2_sa_list, dict):
+        raw = phase2_sa_list.get("phase2_sa") or []
+        if isinstance(raw, list):
+            phase2 = raw
+        elif isinstance(raw, dict):
+            phase2 = [raw]
+    return _redact({
+        key: value
+        for key, value in {
+            "id": name,
+            "enabled": enabled,
+            "connected": connected,
+            "ui_status": ui_status,
+            "initiator": status.get("initiator"),
+            "ike_state": ike_state,
+            "state": phase_state,
+            "local_endpoint": status.get("local-endpoint-address"),
+            "remote_endpoint": status.get("remote-endpoint-address"),
+            "via": status.get("via") or None,
+            "remote_peer": config.get("remote_peer"),
+            "mode": config.get("mode"),
+            "profile": config.get("crypto_ipsec_profile_name"),
+            **map_flags,
+            "phase1": phase1,
+            "phase2_sa": phase2 or None,
+        }.items()
+        if value is not None and value != [] and value != {}
+    })
+
+
+async def get_ipsec_runtime(name: str = "") -> dict:
+    """Read-only normalized runtime from show/crypto/map (+ map connect/nail-up flags).
+
+    Does not initiate IKE. On NDMS 5.01 enable/autoconnect/nail-up are config flags;
+    ike_state=UNDEFINED with enabled=yes means NO_LINK (waiting for peer/traffic).
+    """
+    async with _get_client() as client:
+        statuses = _normalize_status_map(await client.rci_get(_RCI_PATHS["status_map"]))
+        map_rc = {}
+        try:
+            raw = await client.rci_get(_RCI_PATHS["map_rc"])
+            map_rc = raw if isinstance(raw, dict) else {}
+        except Exception:  # noqa: BLE001
+            map_rc = {}
+        service = {}
+        try:
+            service = await client.rci_get(_RCI_PATHS["service"])
+        except Exception:  # noqa: BLE001
+            service = {}
+
+    if name.strip():
+        key = name.strip()
+        if key not in statuses and key not in map_rc:
+            raise ValueError(f"IPsec map not found: {key}")
+        return {
+            "ok": True,
+            "service_ipsec": _as_bool(service.get("ipsec")) if isinstance(service, dict) else None,
+            "runtime": _runtime_from_map_entry(key, statuses.get(key), map_rc.get(key)),
+            "note": (
+                "enable/connect/nail-up are config flags; no RCI runtime IKE initiate on NDMS 5.01. "
+                "See diagnose_ipsec_bringup."
+            ),
+        }
+
+    items = []
+    keys = sorted(set(statuses) | set(map_rc))
+    for key in keys:
+        items.append(_runtime_from_map_entry(key, statuses.get(key), map_rc.get(key)))
+    return {
+        "ok": True,
+        "service_ipsec": _as_bool(service.get("ipsec")) if isinstance(service, dict) else None,
+        "count": len(items),
+        "runtime": items,
+        "note": (
+            "enable/connect/nail-up are config flags; no RCI runtime IKE initiate on NDMS 5.01. "
+            "See diagnose_ipsec_bringup."
+        ),
+    }
+
+
+async def diagnose_ipsec_bringup(name: str) -> dict:
+    """Read-only checklist when map is enabled but ike_state stays UNDEFINED.
+
+    Documents NDMS 5.01 finding: set_ipsec_state(enable) and map.connect (autoconnect)
+    do NOT send IKE_SA_INIT by themselves. nail-up holds SA after establish.
+    First bring-up typically needs interesting traffic to remote TS and/or peer
+    initiating. No fake connect_ipsec tool is exposed.
+    """
+    if not name.strip():
+        raise ValueError("name is required")
+    conn_name = name.strip()
+    async with _get_client() as client:
+        rc_s2s = await _load_rc_connections(client)
+        sc_s2s, statuses = await _load_connections(client)
+        map_rc = {}
+        try:
+            raw = await client.rci_get(_RCI_PATHS["map_rc"])
+            map_rc = raw if isinstance(raw, dict) else {}
+        except Exception as exc:  # noqa: BLE001
+            map_rc = {"__error__": str(exc).split("\n")[0][:160]}
+        service = {}
+        try:
+            service = await client.rci_get(_RCI_PATHS["service"])
+        except Exception:  # noqa: BLE001
+            service = {}
+        crypto = await client.rci_get(_RCI_PATHS["crypto"])
+
+    cfg = rc_s2s.get(conn_name) or sc_s2s.get(conn_name) or {}
+    if not cfg and conn_name not in statuses:
+        raise ValueError(f"IPsec connection not found: {conn_name}")
+
+    runtime = _runtime_from_map_entry(
+        conn_name,
+        statuses.get(conn_name),
+        map_rc.get(conn_name) if isinstance(map_rc.get(conn_name), dict) else None,
+    )
+    checklist = []
+    warnings = []
+
+    def check(ok: bool, item: str, hint: str = "") -> None:
+        checklist.append({"ok": ok, "item": item, "hint": hint or None})
+
+    check(bool(cfg), "site-to-site profile present in show/rc or show/sc")
+    check(
+        (cfg.get("peer") not in (None, "", "any")) or bool(_as_bool(cfg.get("passive"))),
+        "peer or passive responder configured",
+    )
+    check(bool(cfg.get("ike-psk")), "ike-psk configured (has_psk)")
+    check(bool(cfg.get("ipsec-local-networks")), "local traffic selector set")
+    check(bool(cfg.get("ipsec-remote-networks")), "remote traffic selector set")
+    check(runtime.get("enabled") is True, "crypto map enabled (set_ipsec_state)", "enable ≠ IKE_SA_INIT")
+    check(
+        _as_bool(service.get("ipsec")) is True if isinstance(service, dict) else False,
+        "system service.ipsec=true",
+    )
+    map_connect = runtime.get("map_connect")
+    autoconnect = _as_bool(cfg.get("autoconnect"))
+    check(
+        map_connect is True or autoconnect is True,
+        "autoconnect / map.connect enabled",
+        "map.connect only means 'enable autoconnection' config — not initiate",
+    )
+    check(
+        _as_bool(cfg.get("nail-up")) is True or runtime.get("map_nail_up") is True,
+        "nail-up set (holds SA after establish; not first initiate)",
+    )
+
+    ike_undefined = runtime.get("ike_state") == "UNDEFINED"
+    if runtime.get("enabled") and ike_undefined:
+        warnings.append(
+            "enabled=yes but ike_state=UNDEFINED (UI NO_LINK): NDMS has not completed "
+            "IKE_SA_INIT. No RCI initiate/start/connect-action found on 5.01."
+        )
+        warnings.append(
+            "Workaround: generate interesting traffic from local TS to remote TS "
+            f"(e.g. {_split_subnets(cfg.get('ipsec-local-networks'))} → "
+            f"{_split_subnets(cfg.get('ipsec-remote-networks'))}), "
+            "or have the peer initiate; then re-check get_ipsec_runtime / show_ipsec_sa."
+        )
+        warnings.append(
+            "Do not expect set_ipsec_state(enable) or crypto map connect to produce "
+            "UDP/500|4500 by itself (live nc-office finding)."
+        )
+    if runtime.get("connected"):
+        warnings.append("PHASE2_ESTABLISHED — tunnel is up")
+
+    crypto_empty = crypto in (None, {}, [])
+    if crypto_empty and runtime.get("enabled"):
+        warnings.append("show/crypto is empty while map enabled — engine has no live SA dump")
+
+    return _redact({
+        "ok": True,
+        "id": conn_name,
+        "runtime": runtime,
+        "profile": {
+            "peer": cfg.get("peer"),
+            "passive": _as_bool(cfg.get("passive")),
+            "autoconnect": autoconnect,
+            "nail_up": _as_bool(cfg.get("nail-up")),
+            "local_networks": _split_subnets(cfg.get("ipsec-local-networks")),
+            "remote_networks": _split_subnets(cfg.get("ipsec-remote-networks")),
+            "has_psk": bool(cfg.get("ike-psk")),
+            "ike_protocol": cfg.get("ike-protocol"),
+        },
+        "service_ipsec": _as_bool(service.get("ipsec")) if isinstance(service, dict) else None,
+        "checklist": checklist,
+        "warnings": warnings,
+        "research": {
+            "runtime_initiate": "NOT_FOUND",
+            "ui": "enable toggle only (crypto.map.enable + service.ipsec); no Connect button",
+            "parse_crypto_map_connect": "config flag 'enable autoconnection' (≠ IKE_SA_INIT)",
+            "nail_up": "active renegotiation / hold after SA",
+            "semantics": "B — first bring-up needs interesting traffic or remote initiate",
+        },
+        "next_steps": [
+            "Confirm peer strongSwan listens on UDP/500 and UDP/4500 and IDs/PSK/TS match",
+            "From LAN host in local TS, send traffic to an IP in remote TS",
+            "Re-run get_ipsec_runtime / show_ipsec_sa; on VPS check swanctl --list-sas / tcpdump",
+        ],
+    })
 
 async def _save_config(client) -> Any:
     resp = await client.rci({"system": {"configuration": {"save": {}}}})
@@ -953,7 +1212,12 @@ async def set_ipsec_state(
     """Enable/disable IPsec crypto map via parse only. Requires confirm=true.
 
     Uses \"crypto map {name} enable\" or \"no crypto map {name} enable\".
+    On enable also sets service.ipsec=true (same as Keenetic UI toggle).
     Does NOT write site-to-site JSON with enable (that resets peer and other fields).
+
+    IMPORTANT (NDMS 5.01): enable ≠ IKE_SA_INIT. After enable, ike_state may stay
+    UNDEFINED (NO_LINK) until interesting traffic or the peer initiates.
+    There is no connect_ipsec runtime tool — see diagnose_ipsec_bringup.
     """
     assert_writable()
     _require_confirm(confirm)
@@ -984,6 +1248,10 @@ async def set_ipsec_state(
             "action": "enabled" if enabled else "disabled",
             "saved": saved,
             "enabled": enabled,
+            "note": (
+                "enable is a config flag; it does not by itself send IKE_SA_INIT on NDMS 5.01"
+                if enabled else None
+            ),
         })
     except Exception as exc:  # noqa: BLE001
         raise type(exc)(_sanitize_error(exc)) from None
@@ -1040,6 +1308,8 @@ def register(mcp) -> None:
     mcp.tool()(list_ipsec)
     mcp.tool()(list_ipsec_connections)
     mcp.tool()(get_ipsec)
+    mcp.tool()(get_ipsec_runtime)
+    mcp.tool()(diagnose_ipsec_bringup)
     mcp.tool()(list_ipsec_proposals)
     mcp.tool()(show_ipsec_sa)
     mcp.tool()(show_ipsec)

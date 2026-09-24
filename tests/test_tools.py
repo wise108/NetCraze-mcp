@@ -538,7 +538,8 @@ async def test_create_ipsec_s2s_order_enable_save(mock_client):
     assert "enable" not in s2s
     assert list(rci_payloads[0][0]["crypto"]["ipsec"].keys()) == ["site-to-site"]
     assert rci_payloads[1] == {"parse": "crypto map nc-office enable"}
-    assert rci_payloads[2] == {"system": {"configuration": {"save": {}}}}
+    assert rci_payloads[2] == {"service": {"ipsec": True}}
+    assert rci_payloads[3] == {"system": {"configuration": {"save": {}}}}
 
 
 async def test_set_ipsec_state_parse_only(mock_client):
@@ -560,6 +561,7 @@ async def test_set_ipsec_state_parse_only(mock_client):
     await set_ipsec_state("office", enabled=False, confirm=True)
     assert calls[0] == {"parse": "no crypto map office enable"}
     assert calls[1] == {"system": {"configuration": {"save": {}}}}
+    assert all("site-to-site" not in str(c) for c in calls)
 
 
 async def test_create_confirm_false_raises(mock_client):
@@ -694,6 +696,102 @@ async def test_update_keep_psk_does_not_leak(mock_client):
     s2s = calls[0][0]["crypto"]["ipsec"]["site-to-site"]
     assert s2s["ike-psk"] == "KeepMeSecretPSK======="
     assert s2s["peer"] == "9.9.9.9"
+
+
+# ─── ipsec runtime / diagnose (0.11.0) ────────────────────────────────────────
+
+from netcraze_mcp.tools.ipsec import diagnose_ipsec_bringup, get_ipsec_runtime
+import netcraze_mcp.tools.ipsec as ipsec_mod
+
+
+async def test_get_ipsec_runtime_normalized(mock_client):
+    async def rci_get(path):
+        if path == "show/crypto/map":
+            return {
+                "crypto_map": {
+                    "nc-office": {
+                        "config": {"enabled": "yes", "remote_peer": "45.89.63.73", "mode": "tunnel"},
+                        "status": {
+                            "initiator": True,
+                            "ike_state": "UNDEFINED",
+                            "state": "UNDEFINED",
+                            "local-endpoint-address": "0.0.0.0",
+                            "remote-endpoint-address": "0.0.0.0",
+                        },
+                    }
+                }
+            }
+        if path == "show/rc/crypto/map":
+            return {
+                "nc-office": {
+                    "connect": True,
+                    "nail-up": True,
+                    "enable": True,
+                }
+            }
+        if path == "service":
+            return {"ipsec": True}
+        return {}
+
+    mock_client.rci_get.side_effect = rci_get
+    result = await get_ipsec_runtime("nc-office")
+    rt = result["runtime"]
+    assert rt["ui_status"] == "NO_LINK"
+    assert rt["connected"] is False
+    assert rt["map_connect"] is True
+    assert result["service_ipsec"] is True
+    assert "IKE" in result["note"] or "initiate" in result["note"]
+
+
+async def test_diagnose_ipsec_bringup_warns_undefined(mock_client):
+    async def rci_get(path):
+        cfg = {
+            "nc-office": {
+                "peer": "45.89.63.73",
+                "ike-psk": "secret-should-not-leak",
+                "autoconnect": True,
+                "nail-up": True,
+                "passive": False,
+                "ipsec-local-networks": "192.168.1.0/24",
+                "ipsec-remote-networks": "1.1.1.1/32",
+                "ike-protocol": "ikev2",
+            }
+        }
+        if "site-to-site" in path:
+            return cfg
+        if path == "show/crypto/map":
+            return {
+                "crypto_map": {
+                    "nc-office": {
+                        "config": {"enabled": "yes"},
+                        "status": {"ike_state": "UNDEFINED", "state": "UNDEFINED"},
+                    }
+                }
+            }
+        if path == "show/rc/crypto/map":
+            return {"nc-office": {"connect": True, "nail-up": True, "enable": True}}
+        if path == "service":
+            return {"ipsec": True}
+        if path == "show/crypto":
+            return {}
+        return {}
+
+    mock_client.rci_get.side_effect = rci_get
+    result = await diagnose_ipsec_bringup("nc-office")
+    assert result["research"]["runtime_initiate"] == "NOT_FOUND"
+    assert "secret-should-not-leak" not in str(result)
+    assert result["profile"]["has_psk"] is True
+    assert any("UNDEFINED" in w for w in result["warnings"])
+
+
+def test_no_fake_connect_ipsec_tool_exported():
+    assert not hasattr(ipsec_mod, "connect_ipsec")
+    assert not hasattr(ipsec_mod, "disconnect_ipsec")
+    assert not hasattr(ipsec_mod, "initiate_ipsec")
+    src = __import__("inspect").getsource(ipsec_mod)
+    assert "NOT_FOUND" in src or "NOT FOUND" in src
+    assert "def connect_ipsec" not in src
+    assert "def disconnect_ipsec" not in src
 
 
 # ─── components / firmware / storage ──────────────────────────────────────────

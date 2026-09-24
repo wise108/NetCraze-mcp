@@ -65,7 +65,9 @@ from .tools.wireguard import (
 from .tools.ipsec import (
     create_ipsec_s2s,
     delete_ipsec,
+    diagnose_ipsec_bringup,
     get_ipsec,
+    get_ipsec_runtime,
     list_ipsec,
     list_ipsec_connections,
     list_ipsec_proposals,

@@ -91,7 +91,7 @@ add_dns_route(list_name="Gemini", interface="Wireguard3", auto=true, enabled=tru
 |---|---|
 | `create_ipsec_s2s` | Создать/обновить S2S (idempotent по `name`); **confirm=true** обязателен |
 | `update_ipsec_s2s` | Full-replace RMW; `keep_psk=true` читает PSK из RC только в памяти |
-| `set_ipsec_state` | Только `parse crypto map … enable` / `no crypto map … enable` |
+| `set_ipsec_state` | Только `parse crypto map … enable` / `no crypto map … enable` (+ `service.ipsec=true` при enable) |
 | `delete_ipsec` | Flat `{name, no: true}` → «removed crypto map.» |
 
 Каноническая последовательность:
@@ -127,6 +127,34 @@ create_ipsec_s2s(
 - `ike-prf` может остаться `""` в RC; `force-encaps` может отсутствовать в RC после set (для double-NAT смотри `show/crypto/map`)
 - `crypto map X disable` не существует → используем `no crypto map X enable`
 - PSK никогда не возвращается (`has_psk` only); нужен `confirm=true` + writable (не safe-mode)
+
+### IPsec runtime bring-up (0.11.0)
+
+| Инструмент | Описание |
+|---|---|
+| `get_ipsec_runtime` | Read-only: enabled / ike_state / state / endpoints / map.connect|nail-up / ui_status |
+| `diagnose_ipsec_bringup` | Read-only checklist когда enable=yes, но IKE не стартует |
+
+**Research (websun NC-1812, NDMS 5.01 + ipsec 6.0.1-6) — runtime initiate NOT FOUND:**
+
+| Флаг / действие | Семантика |
+|---|---|
+| `set_ipsec_state(enable)` / UI toggle / `crypto.map.{name}.enable` | Config: map enabled. **≠ IKE_SA_INIT** |
+| `crypto map X connect` / `map.connect=true` | Config: «enable autoconnection» (≈ autoconnect). **≠ initiate** |
+| `nail-up` | «active renegotiation» — держать SA после установления, не первый bring-up |
+| UI Connect button | **Нет** — только toggle enable |
+| `initiate` / `start` / `up` / `clear crypto sa` | **Нет таких CLI** |
+
+Вывод (семантика **B**): после enable+autoconnect+nail-up `ike_state` может остаться `UNDEFINED` (UI `NO_LINK`) до interesting traffic на remote TS и/или пока peer сам не инициирует.  
+Поэтому **`connect_ipsec` / `disconnect_ipsec` не публикуются** (нет честного runtime endpoint).
+
+Последовательность NC→strongSwan:
+
+```text
+create_ipsec_s2s → set_ipsec_state(enable) → diagnose_ipsec_bringup
+→ трафик LAN(local TS) → remote TS  ИЛИ  swanctl initiate на VPS
+→ get_ipsec_runtime / show_ipsec_sa
+```
 
 ### Raw RCI + аудит (read-only, 0.9.0)
 
