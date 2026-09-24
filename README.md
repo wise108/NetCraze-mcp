@@ -143,6 +143,8 @@ create_ipsec_s2s(
 
 **0.11.1:** `get_running_config_redacted` redact’ит `crypto ike key …`; runtime endpoints одинаковы в diagnose/get; diagnose не врёт «IKE не стартовал», если charon CONNECTING.
 
+**0.11.3:** diagnose warnings согласованы с conntrack; clone/rename не шлют force-encaps если absent у source.
+
 **0.11.2:** `rename_ipsec` / `clone_ipsec` / `source_name`; `get_ike_conntrack`; `ike_phase=none` при `0 up, 0 connecting`; `ike_prf=""` omit; `get_packet_capture_status`.
 
 **Research (websun NC-1812, NDMS 5.01 + ipsec 6.0.1-6) — runtime initiate NOT FOUND:**

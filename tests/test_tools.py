@@ -961,6 +961,8 @@ async def test_diagnose_charon_none_and_conntrack(mock_client):
     assert result["ike_path"]["conntrack"]["summary"]["udp500_out"] is True
     assert result["ike_path"]["conntrack"]["summary"]["udp500_reply"] is False
     assert "secret-should-not-leak" not in str(result)
+    assert not any("no local IKE attempt" in w for w in result["warnings"])
+    assert any("UNREPLIED" in w or "no reply" in w for w in result["warnings"])
 
     from netcraze_mcp.tools.ipsec import get_ike_conntrack
     ct = await get_ike_conntrack(name="weasel-vps")
@@ -1023,6 +1025,7 @@ async def test_rename_ipsec_roundtrip_no_psk_in_args(mock_client):
         name = s2s["name"]
         assert "ike-psk" in s2s and s2s["ike-psk"] == "LiveSecretMustStayInternal"
         assert "ike-prf" not in s2s  # empty source prf omitted
+        assert "force-encaps" not in s2s  # absent on source → omit
         store[name] = dict(s2s)
         return {"ok": True}
 
@@ -1120,6 +1123,8 @@ async def test_clone_ipsec_no_psk_in_response(mock_client):
     assert cloned["action"] == "created"
     assert cloned["id"] == "weasel-vps-clone-tmp"
     assert "CloneSecret" not in str(cloned)
+    assert not any("force-encaps" in str(w) and "sent True" in str(w) for w in (cloned.get("warnings") or []))
+    assert "force-encaps" not in store["weasel-vps-clone-tmp"]
     assert "weasel-vps-clone-tmp" in store
     deleted = await delete_ipsec("weasel-vps-clone-tmp", confirm=True)
     assert deleted["deleted"] is True

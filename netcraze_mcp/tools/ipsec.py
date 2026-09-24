@@ -501,7 +501,7 @@ def _rc_profile_to_kwargs(cfg: dict, *, name: str, ike_psk: str) -> dict[str, An
         "force_encaps": (
             _as_bool(cfg.get("force-encaps"))
             if cfg.get("force-encaps") is not None
-            else True
+            else None  # absent in RC → omit on clone/rename (do not invent True)
         ),
     }
 
@@ -881,6 +881,21 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
 
     ike_undefined = runtime.get("ike_state") == "UNDEFINED"
     charon_phase = str(charon.get("ike_phase") or "none").upper()
+
+    ike_path = None
+    peer_addr = str(cfg.get("peer") or runtime.get("remote_peer") or "")
+    if peer_addr and peer_addr != "any":
+        try:
+            async with _get_client() as client:
+                ike_path = await _collect_ike_conntrack(client, peer=peer_addr)
+        except Exception as exc:  # noqa: BLE001
+            ike_path = {"ok": False, "error": str(exc).split("\n")[0][:200]}
+
+    ct_summary = (ike_path or {}).get("summary") if isinstance(ike_path, dict) else None
+    ct_summary = ct_summary if isinstance(ct_summary, dict) else {}
+    udp500_out = bool(ct_summary.get("udp500_out"))
+    udp500_reply = bool(ct_summary.get("udp500_reply"))
+
     if runtime.get("enabled") and ike_undefined:
         if charon_phase == "CONNECTING":
             warnings.append(
@@ -891,6 +906,9 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
             warnings.append(
                 "map ike_state=UNDEFINED but charon ESTABLISHED — map status lag; re-check get_ipsec_runtime"
             )
+        elif udp500_out:
+            # local attempt proven by conntrack — never say "no local IKE attempt yet"
+            pass
         else:
             warnings.append(
                 "enabled=yes, map ike_state=UNDEFINED, no local charon SA: "
@@ -902,6 +920,16 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
                 f"{_split_subnets(cfg.get('ipsec-remote-networks'))}), "
                 "or have the peer initiate; then re-check get_ipsec_runtime / show_ipsec_sa."
             )
+        if udp500_out and not udp500_reply:
+            warnings.append(
+                "conntrack: outgoing UDP/500 to peer with no reply (UNREPLIED) — "
+                "path/NAT/filter/peer, not missing local initiate"
+            )
+        elif udp500_out and charon_phase not in ("CONNECTING", "ESTABLISHED"):
+            warnings.append(
+                "conntrack: outgoing UDP/500 seen — local IKE packets left the router; "
+                "check peer reply / path"
+            )
         warnings.append(
             "Do not expect set_ipsec_state(enable) or crypto map connect alone to finish "
             "IKE; no RCI connect_ipsec on NDMS 5.01."
@@ -912,15 +940,6 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
     crypto_empty = crypto in (None, {}, [])
     if crypto_empty and runtime.get("enabled"):
         warnings.append("show/crypto is empty while map enabled — engine has no live SA dump")
-
-    ike_path = None
-    peer_addr = str(cfg.get("peer") or runtime.get("remote_peer") or "")
-    if peer_addr and peer_addr != "any":
-        try:
-            async with _get_client() as client:
-                ike_path = await _collect_ike_conntrack(client, peer=peer_addr)
-        except Exception as exc:  # noqa: BLE001
-            ike_path = {"ok": False, "error": str(exc).split("\n")[0][:200]}
 
     return _redact({
         "ok": True,
@@ -951,7 +970,7 @@ async def diagnose_ipsec_bringup(name: str) -> dict:
         },
         "next_steps": [
             "Confirm peer strongSwan listens on UDP/500 and UDP/4500 and IDs/PSK/TS match",
-            "If charon CONNECTING but peer sees 0 packets — check NAT/path/filter, not only traffic-trigger",
+            "If charon CONNECTING or udp500_out without reply — check NAT/path/filter, not only traffic-trigger",
             "From LAN host in local TS, send traffic to an IP in remote TS if charon has no SA yet",
             "Re-run get_ipsec_runtime / show_ipsec_sa; on VPS check swanctl --list-sas / tcpdump",
         ],
@@ -1263,7 +1282,7 @@ async def create_ipsec_s2s(
     nail_up: bool = True,
     autoconnect: bool = True,
     passive: bool = False,
-    force_encaps: bool | None = True,
+    force_encaps: bool | None = None,
     enable: bool = True,
     save: bool = True,
     confirm: bool = False,
@@ -1273,6 +1292,7 @@ async def create_ipsec_s2s(
     If source_name is set, missing fields (and PSK when keep_psk) are copied from that
     profile in show/rc — ike_psk is then optional. PSK is never returned.
     ike_prf=\"\" omits the field (NDMS often stores empty prf).
+    force_encaps=None: fresh create defaults to True; source_name copies RC (omit if absent).
     """
     assert_writable()
     _require_confirm(confirm)
@@ -1307,6 +1327,8 @@ async def create_ipsec_s2s(
                     kwargs["local_networks"] = local_networks
                 if remote_networks not in ("", [], None):
                     kwargs["remote_networks"] = remote_networks
+                if force_encaps is not None:
+                    kwargs["force_encaps"] = force_encaps
             else:
                 if not ike_psk:
                     raise ValueError("ike_psk is required unless source_name is set")
@@ -1339,7 +1361,7 @@ async def create_ipsec_s2s(
                     "nail_up": nail_up,
                     "autoconnect": autoconnect,
                     "passive": passive,
-                    "force_encaps": force_encaps,
+                    "force_encaps": True if force_encaps is None else force_encaps,
                 }
             payload = _s2s_flat_payload(**kwargs)
             conn_name = payload["name"]
@@ -1470,7 +1492,7 @@ async def update_ipsec_s2s(
                 "autoconnect": autoconnect if autoconnect is not None else bool(_as_bool(cur.get("autoconnect")) if cur.get("autoconnect") is not None else True),
                 "passive": passive if passive is not None else bool(_as_bool(cur.get("passive")) or False),
                 "force_encaps": force_encaps if force_encaps is not None else (
-                    _as_bool(cur.get("force-encaps")) if cur.get("force-encaps") is not None else True
+                    _as_bool(cur.get("force-encaps")) if cur.get("force-encaps") is not None else None
                 ),
             }
             payload = _s2s_flat_payload(**kwargs)
