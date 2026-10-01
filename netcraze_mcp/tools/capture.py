@@ -620,6 +620,101 @@ async def download_packet_capture(
         raise type(exc)(_sanitize_error(exc)) from None
 
 
+async def capture_flow_summary(
+    interface: str,
+    host: str = "",
+    port: int | None = None,
+    filter: str = "",
+    filter_preset: str = "",
+    duration_sec: int = 8,
+    direction: str = "out",
+    confirm: bool = False,
+) -> dict:
+    """High-level: start capture → wait → stop → summary parse → delete instance.
+
+    Requires confirm=true (starts/stops monitor capture). Default returns summary only
+    (no raw pcap in chat). Uses existing monitor lifecycle tools.
+    """
+    assert_writable()
+    _require_confirm(confirm)
+    iface = interface.strip()
+    if not iface:
+        raise ValueError("interface is required")
+    duration_sec = max(2, min(int(duration_sec), 60))
+    host_s = host.strip()
+    port_i = int(port) if port is not None else None
+    if not (filter.strip() or filter_preset.strip() or host_s or port_i):
+        raise ValueError("provide filter, filter_preset, host, and/or port (refusing full-iface capture)")
+    bpf_parts = []
+    if filter.strip():
+        bpf_parts.append(filter.strip())
+    if host_s and port_i:
+        bpf_parts.append(f"host {host_s} and port {port_i}")
+    elif host_s:
+        bpf_parts.append(f"host {host_s}")
+    elif port_i:
+        bpf_parts.append(f"port {port_i}")
+    extra_filter = " and ".join(f"({p})" for p in bpf_parts) if bpf_parts else ""
+    preset = filter_preset.strip()
+    try:
+        started = await start_packet_capture(
+            interface=iface,
+            filter=extra_filter,
+            filter_preset=preset if not extra_filter else "",
+            host="",
+            direction=direction,
+            max_seconds=duration_sec,
+            confirm=True,
+        )
+        # auto_stopped already when max_seconds set; ensure stopped
+        if started.get("running"):
+            await stop_packet_capture(id=iface, confirm=True)
+        summary = await download_packet_capture(
+            id=iface,
+            format="summary",
+            max_packets_preview=40,
+        )
+        preview = summary.get("preview") or []
+        talkers: dict[str, int] = {}
+        syn = ack = 0
+        for pkt in preview:
+            src = pkt.get("src")
+            dst = pkt.get("dst")
+            if src:
+                talkers[src] = talkers.get(src, 0) + 1
+            if dst:
+                talkers[dst] = talkers.get(dst, 0) + 1
+            # TCP flags not in lightweight parser — leave 0
+        top = sorted(talkers.items(), key=lambda item: item[1], reverse=True)[:10]
+        deleted = await delete_packet_capture(id=iface, confirm=True)
+        return {
+            "ok": True,
+            "interface": iface,
+            "filter": started.get("filter"),
+            "duration_sec": duration_sec,
+            "packets": summary.get("packets_total") or started.get("packets") or 0,
+            "ike_summary": summary.get("ike_summary"),
+            "top_talkers": [{"ip": ip, "packets": n} for ip, n in top],
+            "syn_count": syn,
+            "ack_count": ack,
+            "preview": preview[:20],
+            "capture_file": summary.get("capture_file"),
+            "cleaned_up": bool(deleted.get("deleted")),
+            "note": "Raw pcap not inlined; use download_packet_capture(format=pcap) if needed before delete.",
+        }
+    except Exception as exc:  # noqa: BLE001
+        # best-effort cleanup
+        try:
+            await stop_packet_capture(id=iface, confirm=True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await delete_packet_capture(id=iface, confirm=True)
+        except Exception:  # noqa: BLE001
+            pass
+        raise type(exc)(_sanitize_error(exc)) from None
+
+
 def register(mcp) -> None:
     mcp.tool()(get_packet_capture_status)
     mcp.tool()(list_packet_captures)
@@ -629,3 +724,4 @@ def register(mcp) -> None:
     mcp.tool()(stop_packet_capture)
     mcp.tool()(download_packet_capture)
     mcp.tool()(delete_packet_capture)
+    mcp.tool()(capture_flow_summary)

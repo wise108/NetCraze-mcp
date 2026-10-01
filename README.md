@@ -130,6 +130,19 @@ create_ipsec_s2s(
 - `crypto map X disable` не существует → используем `no crypto map X enable`
 - PSK никогда не возвращается (`has_psk` only); нужен `confirm=true` + writable (не safe-mode)
 
+### VPN datapath diagnostics (0.13.0)
+
+| Инструмент | Статус на NDMS 5.01 |
+|---|---|
+| `get_wireguard_runtime` | handshake age, rx/tx, endpoint, keepalive, peer_online |
+| `get_interface_counters` | rx/tx/errors/drops + optional delta |
+| `explain_dns_route` | domain-list → dns-proxy interface |
+| `explain_route` | LPM show/ip/route + dns hint |
+| `list_datapath_capabilities` / `list_rci_readonly_catalog` | честная матрица / каталог RCI |
+| `get_conntrack` / `get_hotspot` | фильтр NAT sessions / RO hotspot hosts |
+| `capture_flow_summary` | start→stop→summary→cleanup (`confirm=true`) |
+| `router_http_probe` / `router_tcp_check` / `router_exit_ip` / `router_http_speed` | **unsupported** (нет tools.curl/tcp) — явный ответ + fallbacks |
+
 ### Packet capture / monitor (0.12.0)
 
 | Инструмент | Описание |
@@ -156,6 +169,10 @@ NDMS: start=`enable`, stop=`no enable`; BPF в кавычках; pcap часто
 | `clone_ipsec` / `create_ipsec_s2s(source_name=…)` | Clone с `keep_psk`; `ike_psk` не required |
 
 **0.11.1:** `get_running_config_redacted` redact’ит `crypto ike key …`; runtime endpoints одинаковы в diagnose/get; diagnose не врёт «IKE не стартовал», если charon CONNECTING.
+
+**0.13.1:** `get_conntrack(host/port/protocol)` + RO `get_hotspot`; pip metadata synced.
+
+**0.13.0:** VPN datapath explain/runtime/counters; L7 probes marked unsupported on NDMS.
 
 **0.12.0:** packet capture lifecycle (monitor enable/no enable + /ci/temp pcap).
 
@@ -198,6 +215,8 @@ create_ipsec_s2s → set_ipsec_state(enable) → diagnose_ipsec_bringup
 | `get_policy_routing_summary` | DNS-routes + static routes + ip rule/policy |
 | `list_firewall_rules` | access-list + security-level |
 | `list_nat_rules` | port forwards + UPnP + count conntrack (без полного dump) |
+| `get_conntrack` | фильтр live NAT sessions (host/port/protocol; без полного dump) |
+| `get_hotspot` | RO hotspot hosts (policy/access/wifi) |
 | `router_ping` / `router_traceroute` / `router_nslookup` | Диагностика с лимитами (ping count≤5; traceroute hops≤15) |
 | `get_running_config_redacted` | `show/running-config` без секретов; `filter=interface|crypto|ip|…` |
 | `health_check` | auth/firmware/uptime/WAN + понятные ошибки (timeout/auth/HTTP) |

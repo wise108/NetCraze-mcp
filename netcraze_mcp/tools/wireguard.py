@@ -194,13 +194,157 @@ async def get_wireguard(interface_id: str) -> dict:
     """Get one WireGuard interface; private/preshared keys are never returned."""
     if not interface_id.strip():
         raise ValueError("interface_id is required")
+    needle = interface_id.strip()
     async with _get_client() as client:
-        data = await client.rci_get(f"show/interface/{interface_id.strip()}")
-    if not isinstance(data, dict) or not data:
-        raise ValueError(f"Interface not found: {interface_id}")
-    if data.get("type") and data.get("type") != "Wireguard":
-        raise ValueError(f"Interface is not WireGuard: {interface_id}")
-    return _wg_details(data)
+        try:
+            data = await client.rci_get(f"show/interface/{needle}")
+        except Exception:  # noqa: BLE001
+            data = None
+        if isinstance(data, dict) and data and (not data.get("type") or data.get("type") == "Wireguard"):
+            if data.get("type") == "Wireguard" or "wireguard" in data:
+                return _wg_details(data)
+        for item in await _fetch_wg_ifaces(client):
+            if (item.get("id") or item.get("interface-name")) == needle:
+                return _wg_details(item)
+    raise ValueError(f"Interface not found: {interface_id}")
+
+
+def _handshake_age(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        age = int(value)
+    except (TypeError, ValueError):
+        return None
+    if age >= 2147483647:
+        return None  # never
+    return age
+
+
+async def get_wireguard_runtime(interface_id: str = "") -> dict:
+    """WireGuard runtime like ``wg show``: handshake age, transfer, endpoint, keepalive.
+
+    Reads show/interface + show/sc|rc interface for allow-ips / persistent keepalive.
+    Private keys are never returned. peer_online from NDMS peer.online.
+    """
+    needle = interface_id.strip()
+    async with _get_client() as client:
+        items = await _fetch_wg_ifaces(client)
+        if needle:
+            items = [
+                item for item in items
+                if (item.get("id") or item.get("interface-name")) == needle
+                or item.get("description") == needle
+            ]
+            if not items:
+                available = sorted(
+                    (i.get("id") or i.get("interface-name") or "")
+                    for i in await _fetch_wg_ifaces(client)
+                )
+                return {"ok": False, "error": "not found", "id": needle, "available_ids": available}
+
+        result = []
+        for iface in items:
+            name = iface.get("id") or iface.get("interface-name")
+            wg = iface.get("wireguard") or {}
+            peers_raw = wg.get("peer") or []
+            if isinstance(peers_raw, dict):
+                peers_raw = list(peers_raw.values())
+            # config for allow-ips / keepalive
+            cfg = {}
+            for path in (f"show/rc/interface/{name}", f"show/sc/interface/{name}"):
+                try:
+                    cfg = await client.rci_get(path)
+                    if isinstance(cfg, dict) and cfg:
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            cfg_peers = ((cfg.get("wireguard") or {}).get("peer") if isinstance(cfg, dict) else None) or []
+            if isinstance(cfg_peers, dict):
+                cfg_peers = list(cfg_peers.values())
+            cfg_peer0 = cfg_peers[0] if cfg_peers and isinstance(cfg_peers[0], dict) else {}
+            allow = cfg_peer0.get("allow-ips") or []
+            if isinstance(allow, dict):
+                allow = list(allow.values())
+            allowed_ips = []
+            for item in allow if isinstance(allow, list) else []:
+                if isinstance(item, dict) and item.get("address") is not None:
+                    mask = item.get("mask") or "255.255.255.255"
+                    try:
+                        net = ipaddress.IPv4Network(f"{item['address']}/{mask}", strict=False)
+                        allowed_ips.append(str(net))
+                    except Exception:  # noqa: BLE001
+                        allowed_ips.append(f"{item.get('address')}/{mask}")
+
+            peers_out = []
+            for peer in peers_raw if isinstance(peers_raw, list) else []:
+                if not isinstance(peer, dict):
+                    continue
+                age = _handshake_age(peer.get("last-handshake"))
+                online = bool(peer.get("online")) if peer.get("online") is not None else (age is not None and age < 180)
+                endpoint = None
+                if peer.get("remote-endpoint-address"):
+                    endpoint = (
+                        f"{peer.get('remote-endpoint-address')}:{peer.get('remote-port')}"
+                        if peer.get("remote-port") is not None
+                        else str(peer.get("remote-endpoint-address"))
+                    )
+                ka = None
+                if isinstance(cfg_peer0.get("keepalive-interval"), dict):
+                    ka = cfg_peer0["keepalive-interval"].get("interval")
+                peers_out.append({
+                    key: value
+                    for key, value in {
+                        "public_key": peer.get("public-key") or peer.get("key"),
+                        "endpoint_actual": endpoint,
+                        "via": peer.get("via") or None,
+                        "latest_handshake_age_sec": age,
+                        "handshake_never": peer.get("last-handshake") in (None, 2147483647, "2147483647"),
+                        "transfer_rx_bytes": int(peer.get("rxbytes") or 0),
+                        "transfer_tx_bytes": int(peer.get("txbytes") or 0),
+                        "peer_online": online,
+                        "enabled": peer.get("enabled"),
+                        "persistent_keepalive": int(ka) if ka is not None else None,
+                        "allowed_ips": allowed_ips or None,
+                        "local_endpoint": (
+                            f"{peer.get('local-endpoint-address')}:{peer.get('local-port')}"
+                            if peer.get("local-endpoint-address") and peer.get("local-port") is not None
+                            else None
+                        ),
+                    }.items()
+                    if value is not None
+                })
+            result.append({
+                key: value
+                for key, value in {
+                    "id": name,
+                    "description": iface.get("description"),
+                    "state": iface.get("state"),
+                    "link": iface.get("link"),
+                    "connected": iface.get("connected"),
+                    "address": iface.get("address"),
+                    "listen_port": wg.get("listen-port") or (
+                        (peers_raw[0].get("local-port") if peers_raw and isinstance(peers_raw[0], dict) else None)
+                    ),
+                    "peers": peers_out,
+                    "peer_online": any(p.get("peer_online") for p in peers_out),
+                    "latest_handshake_age_sec": (
+                        min(
+                            (p["latest_handshake_age_sec"] for p in peers_out
+                             if p.get("latest_handshake_age_sec") is not None),
+                            default=None,
+                        )
+                    ),
+                    "transfer_rx_bytes": sum(int(p.get("transfer_rx_bytes") or 0) for p in peers_out),
+                    "transfer_tx_bytes": sum(int(p.get("transfer_tx_bytes") or 0) for p in peers_out),
+                }.items()
+                if value is not None
+            })
+
+    result.sort(key=lambda item: item.get("id") or "")
+    if needle:
+        return {"ok": True, **result[0]} if result else {"ok": False, "error": "not found", "id": needle}
+    return {"ok": True, "interfaces": result, "count": len(result)}
 
 
 async def _import_conf(client, conf_text: str, filename: str) -> str:
@@ -349,6 +493,7 @@ async def delete_wireguard(interface_id: str) -> dict:
 def register(mcp) -> None:
     mcp.tool()(list_wireguard)
     mcp.tool()(get_wireguard)
+    mcp.tool()(get_wireguard_runtime)
     mcp.tool()(add_wireguard_from_conf)
     mcp.tool()(set_wireguard_state)
     mcp.tool()(delete_wireguard)

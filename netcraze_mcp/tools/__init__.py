@@ -4,6 +4,7 @@ from . import (
     backup,
     capture,
     components,
+    datapath,
     diagnostics,
     dns_routes,
     firewall,
@@ -37,6 +38,7 @@ def register_tools(mcp) -> None:
     wireguard.register(mcp)
     ipsec.register(mcp)
     capture.register(mcp)
+    datapath.register(mcp)
     zerotier.register(mcp)
     vpn.register(mcp)
     policy.register(mcp)

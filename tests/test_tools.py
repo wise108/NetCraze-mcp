@@ -1276,6 +1276,144 @@ async def test_start_packet_capture_requires_confirm(mock_client):
         await start_packet_capture(interface="GigabitEthernet1", filter_preset="ike", confirm=False)
 
 
+# ─── datapath diagnostics (0.13.0) ────────────────────────────────────────────
+
+async def test_get_wireguard_runtime_handshake(mock_client):
+    from netcraze_mcp.tools.wireguard import get_wireguard_runtime
+
+    async def rci_get(path):
+        if path == "show/interface":
+            return {
+                "Wireguard2": {
+                    "id": "Wireguard2",
+                    "type": "Wireguard",
+                    "description": "WG-HAPP",
+                    "state": "up",
+                    "link": "up",
+                    "address": "10.255.10.2",
+                    "wireguard": {
+                        "listen-port": 42826,
+                        "peer": [{
+                            "public-key": "abc=",
+                            "online": True,
+                            "last-handshake": 71,
+                            "rxbytes": 1000,
+                            "txbytes": 2000,
+                            "remote-endpoint-address": "192.168.1.254",
+                            "remote-port": 51831,
+                            "via": "Bridge0",
+                            "local-port": 42826,
+                            "local-endpoint-address": "192.168.1.1",
+                            "enabled": True,
+                        }],
+                    },
+                }
+            }
+        if "interface/Wireguard2" in path:
+            return {
+                "wireguard": {
+                    "peer": [{
+                        "keepalive-interval": {"interval": 25},
+                        "allow-ips": [{"address": "0.0.0.0", "mask": "0.0.0.0"}],
+                    }]
+                }
+            }
+        return {}
+
+    mock_client.rci_get.side_effect = rci_get
+    result = await get_wireguard_runtime("Wireguard2")
+    assert result["ok"] is True
+    assert result["peer_online"] is True
+    assert result["latest_handshake_age_sec"] == 71
+    assert result["transfer_rx_bytes"] == 1000
+    assert result["peers"][0]["allowed_ips"] == ["0.0.0.0/0"]
+    assert "private" not in str(result).lower() or "private_key" not in str(result)
+
+
+async def test_get_interface_counters_delta(mock_client):
+    from netcraze_mcp.tools.network import get_interface_counters
+    calls = {"n": 0}
+
+    async def rci(payload):
+        calls["n"] += 1
+        base = 1000 if calls["n"] == 1 else 5000
+        return {"show": {"interface": {"stat": {
+            "rxbytes": base, "txbytes": base // 2,
+            "rxpackets": 10, "txpackets": 5,
+            "rxerrors": 0, "txerrors": 0, "rxdropped": 0, "txdropped": 0,
+            "rxspeed": 100, "txspeed": 50,
+        }}}}
+
+    async def rci_get(path):
+        if path == "show/interface":
+            return {"Wireguard2": {"id": "Wireguard2", "type": "Wireguard"}}
+        return {}
+
+    mock_client.rci.side_effect = rci
+    mock_client.rci_get.side_effect = rci_get
+    result = await get_interface_counters("Wireguard2", second_sample_after_ms=100)
+    assert result["ok"] is True
+    assert result["delta"]["rx_bytes"] == 4000
+    assert result["delta"]["rx_mbps"] >= 0
+
+
+async def test_explain_dns_route_matches_list(mock_client):
+    from netcraze_mcp.tools.datapath import explain_dns_route
+
+    async def rci(payload):
+        return {"show": {"sc": {
+            "object-group": {"fqdn": {
+                "domain-list4": {
+                    "description": "Telegram",
+                    "include": [{"address": "telegram.org"}, {"address": "*.t.me"}],
+                }
+            }},
+            "dns-proxy": {"route": [{
+                "group": "domain-list4",
+                "interface": "Wireguard2",
+                "auto": True,
+                "index": "abc",
+            }]},
+        }}}
+
+    async def rci_continued(payload, **kwargs):
+        return {"messages": ["PING api.telegram.org (1.2.3.4) 56 bytes"], "polls": 1}
+
+    mock_client.rci.side_effect = rci
+    mock_client.rci_continued = rci_continued
+    result = await explain_dns_route("api.telegram.org")
+    assert result["ok"] is True
+    assert result["selected"]["interface"] == "Wireguard2"
+    assert any(m["list_name"] == "Telegram" for m in result["matched_domain_lists"])
+
+
+async def test_router_http_probe_unsupported_honest(mock_client):
+    from netcraze_mcp.tools.datapath import router_http_probe
+
+    async def rci_get(path):
+        if path == "show/interface":
+            return {"Wireguard2": {"id": "Wireguard2", "type": "Wireguard", "state": "up", "link": "up"}}
+        return {}
+
+    async def rci_continued(payload, **kwargs):
+        return {"messages": ["PING x (1.1.1.1)", "1 packets transmitted, 1 packets received"], "polls": 1}
+
+    mock_client.rci_get.side_effect = rci_get
+    mock_client.rci_continued = rci_continued
+    result = await router_http_probe("https://api.telegram.org", interface="Wireguard2")
+    assert result["unsupported"] is True
+    assert result["ok"] is False
+    assert result["interface_used"] == "Wireguard2"
+    assert "curl" in (result.get("error") or "").lower() or "not available" in (result.get("error") or "").lower()
+
+
+async def test_list_datapath_capabilities():
+    from netcraze_mcp.tools.datapath import list_datapath_capabilities
+    caps = await list_datapath_capabilities()
+    assert caps["capabilities"]["get_wireguard_runtime"] is True
+    assert caps["capabilities"]["router_http_probe"] is False
+
+
 # ─── components / firmware / storage ──────────────────────────────────────────
 
 async def test_list_components_marks_installed_and_filters(mock_client):
@@ -1603,6 +1741,66 @@ async def test_get_connected_clients_empty(mock_client):
     result = await get_connected_clients()
     assert result == []
 
+
+async def test_get_hotspot_filters(mock_client):
+    from netcraze_mcp.tools.network import get_hotspot
+    mock_client.rci_get.return_value = {
+        "host": [
+            {
+                "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.1.254", "hostname": "happ",
+                "name": "Happ", "active": True, "registered": True, "access": "permit",
+                "policy": "", "ssid": None,
+                "interface": {"id": "Bridge0", "name": "Home"},
+                "rxbytes": 10, "txbytes": 2,
+            },
+            {
+                "mac": "11:22:33:44:55:66", "ip": "192.168.1.50", "name": "Xbox",
+                "active": False, "registered": True, "access": "permit",
+                "interface": {"id": "Bridge0", "name": "Home"},
+            },
+        ]
+    }
+    all_hosts = await get_hotspot()
+    assert all_hosts["count"] == 2
+    active = await get_hotspot(active_only=True)
+    assert active["count"] == 1
+    by_name = await get_hotspot(name="happ")
+    assert by_name["count"] == 1
+    assert by_name["hosts"][0]["ip"] == "192.168.1.254"
+    assert by_name["hosts"][0]["interface_id"] == "Bridge0"
+
+
+async def test_get_conntrack_filters(mock_client):
+    from netcraze_mcp.tools.firewall import get_conntrack
+    mock_client.rci_get.return_value = [
+        {
+            "protocol": "TCP", "src": "192.168.1.10", "dst": "149.154.167.50",
+            "sport": 50000, "dport": 443, "packets": 5, "bytes": 100,
+            "src-out": "10.255.10.2", "dst-out": "149.154.167.50",
+            "sport-out": 50000, "dport-out": 443, "packets-out": 4, "bytes-out": 80,
+        },
+        {
+            "protocol": "UDP", "src": "192.168.1.10", "dst": "1.1.1.1",
+            "sport": 53000, "dport": 53, "packets": 1, "packets-out": 0,
+        },
+        {
+            "protocol": "TCP", "src": "192.168.1.20", "dst": "8.8.8.8",
+            "sport": 40000, "dport": 443, "packets": 2, "packets-out": 2,
+        },
+    ]
+    result = await get_conntrack(host="192.168.1.10", port=443, protocol="tcp")
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["sessions"][0]["dport"] == 443
+    assert result["sessions"][0]["src_out"] == "10.255.10.2"
+    try:
+        await get_conntrack()
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "host" in str(exc).lower() or "port" in str(exc).lower()
+
+
+# ─── get_connected_clients (cont) ─────────────────────────────────────────────
 
 # ─── get_speed ────────────────────────────────────────────────────────────────
 

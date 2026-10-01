@@ -7,6 +7,7 @@ import netcraze_mcp.config as config
 import netcraze_mcp.tools.backup as backup_tools
 import netcraze_mcp.tools.capture as capture_tools
 import netcraze_mcp.tools.components as components_tools
+import netcraze_mcp.tools.datapath as datapath_tools
 import netcraze_mcp.tools.diagnostics as diagnostics_tools
 import netcraze_mcp.tools.dns_routes as dns_routes_tools
 import netcraze_mcp.tools.firewall as firewall_tools
@@ -62,6 +63,7 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
         backup_tools,
         capture_tools,
         components_tools,
+        datapath_tools,
         network_tools,
         dns_routes_tools,
         static_hosts_tools,

@@ -36,6 +36,62 @@ async def get_connected_clients() -> list[dict]:
         return [_host_to_dict(item) for item in hosts]
 
 
+async def get_hotspot(
+    active_only: bool = False,
+    name: str = "",
+    ip: str = "",
+    mac: str = "",
+) -> dict:
+    """Read-only hotspot hosts (show/ip/hotspot) with audit fields.
+
+    Richer than get_connected_clients: policy/access/ssid/ap/rssi for DoH/Xbox-style checks.
+    Does not change config.
+    """
+    name_s = (name or "").strip().lower()
+    ip_s = (ip or "").strip()
+    mac_s = (mac or "").strip().lower()
+
+    async with _get_client() as client:
+        raw = await client.rci_get("show/ip/hotspot")
+    hosts_raw = []
+    if isinstance(raw, dict):
+        hosts_raw = raw.get("host") or []
+    elif isinstance(raw, list):
+        hosts_raw = raw
+    if not isinstance(hosts_raw, list):
+        hosts_raw = [hosts_raw] if hosts_raw else []
+
+    hosts = []
+    for item in hosts_raw:
+        if not isinstance(item, dict):
+            continue
+        entry = _hotspot_host_to_dict(item)
+        if active_only and not entry.get("active"):
+            continue
+        if name_s:
+            blob = " ".join(
+                str(entry.get(k) or "") for k in ("name", "hostname")
+            ).lower()
+            if name_s not in blob:
+                continue
+        if ip_s and entry.get("ip") != ip_s:
+            continue
+        if mac_s and str(entry.get("mac") or "").lower() != mac_s:
+            continue
+        hosts.append(entry)
+
+    return {
+        "ok": True,
+        "source": "show/ip/hotspot",
+        "count": len(hosts),
+        "hosts": hosts,
+        "note": (
+            "Read-only. Filters are local. "
+            "get_connected_clients remains the compact client list."
+        ),
+    }
+
+
 async def get_speed(interval: float = 3.0) -> dict:
     interval = max(1.0, min(interval, 10.0))
     async with _get_client() as client:
@@ -105,6 +161,81 @@ def _is_wan_interface(iface: dict) -> bool:
             or (iface.get("type") == "GigabitEthernet" and iface.get("address"))
         )
     )
+
+
+async def get_interface_counters(
+    interface: str,
+    second_sample_after_ms: int = 0,
+) -> dict:
+    """Interface rx/tx bytes/packets/errors/drops via show interface stat.
+
+    Optional second_sample_after_ms (100..30000) returns delta rates for A/B tests.
+    Works for WireguardN / ZeroTier0 / GigabitEthernet1 / …
+    """
+    name = (interface or "").strip()
+    if not name:
+        raise ValueError("interface is required")
+    delay_ms = int(second_sample_after_ms or 0)
+    if delay_ms and not (100 <= delay_ms <= 30_000):
+        raise ValueError("second_sample_after_ms must be 0 or 100..30000")
+
+    async def _one(client) -> dict:
+        data = await client.rci({"show": {"interface": {"stat": {"name": name}}}})
+        stat = ((data.get("show") or {}).get("interface") or {}).get("stat") or {}
+        if isinstance(stat, list):
+            stat = stat[0] if stat else {}
+        if not isinstance(stat, dict) or not stat:
+            raise ValueError(f"no counters for interface: {name}")
+        return {
+            "rx_bytes": int(stat.get("rxbytes") or 0),
+            "tx_bytes": int(stat.get("txbytes") or 0),
+            "rx_packets": int(stat.get("rxpackets") or 0),
+            "tx_packets": int(stat.get("txpackets") or 0),
+            "rx_errors": int(stat.get("rxerrors") or 0),
+            "tx_errors": int(stat.get("txerrors") or 0),
+            "rx_dropped": int(stat.get("rxdropped") or 0),
+            "tx_dropped": int(stat.get("txdropped") or 0),
+            "rx_speed_bps": int(stat.get("rxspeed") or 0),
+            "tx_speed_bps": int(stat.get("txspeed") or 0),
+            "timestamp": stat.get("timestamp"),
+        }
+
+    async with _get_client() as client:
+        # validate iface exists
+        raw = await client.rci_get("show/interface")
+        exists = isinstance(raw, dict) and (
+            name in raw
+            or any(
+                isinstance(v, dict) and (v.get("id") == name or v.get("description") == name)
+                for v in raw.values()
+            )
+        )
+        if not exists:
+            raise ValueError(f"interface not found: {name}")
+        first = await _one(client)
+        delta = None
+        if delay_ms:
+            t0 = time.monotonic()
+            await asyncio.sleep(delay_ms / 1000.0)
+            second = await _one(client)
+            dt = max(time.monotonic() - t0, 0.001)
+            delta = {
+                "interval_sec": round(dt, 3),
+                "rx_bytes": second["rx_bytes"] - first["rx_bytes"],
+                "tx_bytes": second["tx_bytes"] - first["tx_bytes"],
+                "rx_packets": second["rx_packets"] - first["rx_packets"],
+                "tx_packets": second["tx_packets"] - first["tx_packets"],
+                "rx_mbps": round((second["rx_bytes"] - first["rx_bytes"]) * 8 / dt / 1_000_000, 3),
+                "tx_mbps": round((second["tx_bytes"] - first["tx_bytes"]) * 8 / dt / 1_000_000, 3),
+                "after": second,
+            }
+
+    return {
+        "ok": True,
+        "interface": name,
+        "snapshot": first,
+        "delta": delta,
+    }
 
 
 async def get_wan_status() -> dict:
@@ -192,6 +323,35 @@ def _host_to_dict(host: Any) -> dict:
     }.items() if value is not None}
 
 
+def _hotspot_host_to_dict(host: Any) -> dict:
+    if not isinstance(host, dict):
+        return {"raw": host}
+    iface = host.get("interface")
+    iface_id = iface.get("id") if isinstance(iface, dict) else None
+    iface_name = iface.get("name") if isinstance(iface, dict) else iface
+    return {key: value for key, value in {
+        "mac": host.get("mac"),
+        "ip": host.get("ip"),
+        "hostname": host.get("hostname") or None,
+        "name": host.get("name") or None,
+        "interface": iface_name,
+        "interface_id": iface_id,
+        "active": host.get("active"),
+        "registered": host.get("registered"),
+        "access": host.get("access"),
+        "policy": host.get("policy") or None,
+        "rx_bytes": host.get("rxbytes"),
+        "tx_bytes": host.get("txbytes"),
+        "uptime": host.get("uptime"),
+        "last_seen": host.get("last-seen"),
+        "ssid": host.get("ssid"),
+        "ap": host.get("ap"),
+        "rssi": host.get("rssi"),
+        "security": host.get("security"),
+        "link": host.get("link"),
+    }.items() if value is not None}
+
+
 def _station_to_dict(station: Any) -> dict:
     if not isinstance(station, dict):
         return {"raw": station}
@@ -223,7 +383,9 @@ def _route_to_dict(route: Any) -> dict:
 def register(mcp) -> None:
     mcp.tool()(get_interfaces)
     mcp.tool()(get_interface)
+    mcp.tool()(get_interface_counters)
     mcp.tool()(get_connected_clients)
+    mcp.tool()(get_hotspot)
     mcp.tool()(get_speed)
     mcp.tool()(get_wifi_associations)
     mcp.tool()(get_routes)
