@@ -591,10 +591,11 @@ async def diagnose_dns_proxy_route(list_name: str) -> dict:
 
 
 async def explain_route(destination: str = "", source: str = "") -> dict:
-    """Explain policy/IP route for a destination IP or hostname.
+    """Explain FIB LPM for a destination IP or hostname (main table).
 
-    Uses longest-prefix match on show/ip/route plus dns-proxy hint when destination
-    is a hostname. Does not change routes.
+    Limitation: bare IP from a dns-proxy CIDR object-group still shows WAN default
+    (0.0.0.0/0) — that is FIB truth, not policy path. Use explain_policy_path /
+    verify_flow_path for dns-proxy → WG/HAPP steering.
     """
     dest = (destination or "").strip()
     if not dest:

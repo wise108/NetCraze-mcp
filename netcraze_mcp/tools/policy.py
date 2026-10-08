@@ -274,13 +274,6 @@ async def get_policy_tables() -> dict:
     for table_n, fwmark in mark_tables.items():
         routes = table_routes.get(table_n) or []
         defaults, on_link_default = _defaults_and_on_link(routes)
-        default_ifaces = {
-            str(d.get("interface")) for d in defaults if d.get("interface")
-        }
-        linked = [
-            dr for dr in (dns_routes if isinstance(dns_routes, list) else [])
-            if isinstance(dr, dict) and dr.get("interface") in default_ifaces
-        ]
         tables.append({
             "id": f"table{table_n}",
             "description": None,
@@ -290,11 +283,38 @@ async def get_policy_tables() -> dict:
             "auto_table": table_n >= 4097,
             "materialized_default": defaults,
             "ON_LINK_DEFAULT": on_link_default,
-            "linked_dns_proxy_routes": linked[:10],
+            "linked_dns_proxy_routes": [],  # filled 1:1 below
             "route_count": len(routes),
             "source": "ip-rule+show-ip-route-table",
         })
         seen_table_ids.add(table_n)
+
+    # 1:1 pair auto-tables ↔ dns-proxy routes on same egress iface (by table4 / index order)
+    from collections import defaultdict
+    by_iface_tables: dict[str, list[dict]] = defaultdict(list)
+    for table in tables:
+        for d in table.get("materialized_default") or []:
+            iface = (d or {}).get("interface")
+            if iface:
+                by_iface_tables[str(iface)].append(table)
+                break
+    by_iface_routes: dict[str, list[dict]] = defaultdict(list)
+    for dr in (dns_routes if isinstance(dns_routes, list) else []):
+        if isinstance(dr, dict) and dr.get("interface") and not dr.get("disable", False):
+            by_iface_routes[str(dr["interface"])].append(dr)
+    for iface, tlist in by_iface_tables.items():
+        t_sorted = sorted(tlist, key=lambda t: (t.get("table4") is None, t.get("table4") or 0))
+        r_sorted = sorted(
+            by_iface_routes.get(iface) or [],
+            key=lambda r: str(r.get("index") or r.get("list_key") or r.get("group") or ""),
+        )
+        for table, route in zip(t_sorted, r_sorted):
+            table["linked_dns_proxy_routes"] = [route]
+        if len(r_sorted) > len(t_sorted) and t_sorted:
+            t_sorted[-1]["linked_dns_proxy_routes"] = [
+                *t_sorted[-1].get("linked_dns_proxy_routes", []),
+                *r_sorted[len(t_sorted):],
+            ]
 
     # 2) Merge any show/ip/policy entries (when firmware populates them)
     if isinstance(policies, dict):
