@@ -262,6 +262,7 @@ async def test_add_wireguard_from_conf_import(mock_client):
         conf=_WG_CONF,
         description="Cloudflare WARP",
         enabled=True,
+        save=True,
     )
     assert result["id"] == "Wireguard3"
     assert result["address"] == "10.13.14.2"
@@ -278,7 +279,7 @@ async def test_add_wireguard_from_conf_import(mock_client):
 async def test_add_wireguard_from_conf_safe_mode(mock_client):
     configure(safe_mode=True)
     with pytest.raises(PermissionError):
-        await add_wireguard_from_conf(conf=_WG_CONF)
+        await add_wireguard_from_conf(conf=_WG_CONF, save=True)
 
 
 async def test_set_wireguard_state(mock_client):
@@ -290,7 +291,7 @@ async def test_set_wireguard_state(mock_client):
         "address": "10.13.14.2",
     }
     mock_client.rci.return_value = {}
-    result = await set_wireguard_state("Wireguard3", enabled=False)
+    result = await set_wireguard_state("Wireguard3", enabled=False, save=True)
     assert result["id"] == "Wireguard3"
     assert result["enabled"] is False
     assert mock_client.rci.call_args.args[0] == [
@@ -302,8 +303,10 @@ async def test_set_wireguard_state(mock_client):
 async def test_delete_wireguard(mock_client):
     mock_client.rci_get.return_value = {"id": "Wireguard3", "type": "Wireguard"}
     mock_client.rci.return_value = {}
-    result = await delete_wireguard("Wireguard3")
-    assert result == {"deleted": True, "id": "Wireguard3"}
+    result = await delete_wireguard("Wireguard3", save=True)
+    assert result["deleted"] is True
+    assert result["id"] == "Wireguard3"
+    assert result.get("config_saved") is True
 
 
 # ─── ipsec (read-only) ────────────────────────────────────────────────────────
@@ -526,6 +529,7 @@ async def test_create_ipsec_s2s_order_enable_save(mock_client):
         local_networks="192.168.1.0/24",
         remote_networks="1.1.1.1/32",
         confirm=True,
+        save=True,
     )
     assert result["action"] in ("created", "updated")
     assert result["saved"] is True
@@ -559,7 +563,7 @@ async def test_set_ipsec_state_parse_only(mock_client):
 
     mock_client.rci.side_effect = rci
     mock_client.rci_get.side_effect = rci_get
-    await set_ipsec_state("office", enabled=False, confirm=True)
+    await set_ipsec_state("office", enabled=False, confirm=True, save=True)
     assert calls[0] == {"parse": "no crypto map office enable"}
     assert calls[1] == {"system": {"configuration": {"save": {}}}}
     assert all("site-to-site" not in str(c) for c in calls)
@@ -621,7 +625,8 @@ async def test_delete_ipsec_flat_no(mock_client):
 
     mock_client.rci.side_effect = rci
     mock_client.rci_get.side_effect = rci_get
-    result = await delete_ipsec("tmp", confirm=True)
+    result = await delete_ipsec("tmp", confirm=True,
+        save=True)
     assert result["deleted"] is True
     assert calls[0] == [{"crypto": {"ipsec": {"site-to-site": {"name": "tmp", "no": True}}}}]
 
@@ -691,7 +696,8 @@ async def test_update_keep_psk_does_not_leak(mock_client):
     mock_client.rci.side_effect = rci
     mock_client.rci_get.side_effect = rci_get
     result = await update_ipsec_s2s(
-        name="office", peer="9.9.9.9", keep_psk=True, enable=None, confirm=True
+        name="office", peer="9.9.9.9", keep_psk=True, enable=None, confirm=True,
+        save=True
     )
     assert "KeepMeSecretPSK" not in str(result)
     s2s = calls[0][0]["crypto"]["ipsec"]["site-to-site"]
@@ -1045,14 +1051,16 @@ async def test_rename_ipsec_roundtrip_no_psk_in_args(mock_client):
     mock_client.rci.side_effect = rci
     mock_client.rci_get.side_effect = rci_get
 
-    renamed = await rename_ipsec("weasel-vps", "weasel-vps-tmp", confirm=True)
+    renamed = await rename_ipsec("weasel-vps", "weasel-vps-tmp", confirm=True,
+        save=True)
     assert renamed["renamed"] is True
     assert renamed["old_id"] == "weasel-vps"
     assert renamed["id"] == "weasel-vps-tmp"
     assert "LiveSecret" not in str(renamed)
     assert list(store.keys()) == ["weasel-vps-tmp"]
 
-    back = await rename_ipsec("weasel-vps-tmp", "weasel-vps", confirm=True)
+    back = await rename_ipsec("weasel-vps-tmp", "weasel-vps", confirm=True,
+        save=True)
     assert back["id"] == "weasel-vps"
     assert list(store.keys()) == ["weasel-vps"]
     configure(safe_mode=None)
@@ -1120,14 +1128,16 @@ async def test_clone_ipsec_no_psk_in_response(mock_client):
     mock_client.rci.side_effect = rci
     mock_client.rci_get.side_effect = rci_get
 
-    cloned = await clone_ipsec("weasel-vps", "weasel-vps-clone-tmp", confirm=True)
+    cloned = await clone_ipsec("weasel-vps", "weasel-vps-clone-tmp", confirm=True,
+        save=True)
     assert cloned["action"] == "created"
     assert cloned["id"] == "weasel-vps-clone-tmp"
     assert "CloneSecret" not in str(cloned)
     assert not any("force-encaps" in str(w) and "sent True" in str(w) for w in (cloned.get("warnings") or []))
     assert "force-encaps" not in store["weasel-vps-clone-tmp"]
     assert "weasel-vps-clone-tmp" in store
-    deleted = await delete_ipsec("weasel-vps-clone-tmp", confirm=True)
+    deleted = await delete_ipsec("weasel-vps-clone-tmp", confirm=True,
+        save=True)
     assert deleted["deleted"] is True
     assert "weasel-vps-clone-tmp" not in store
     configure(safe_mode=None)
@@ -1650,7 +1660,7 @@ async def test_remove_component_without_commit(mock_client):
 
 
 async def test_set_share_sends_batch(mock_client):
-    result = await set_share("Backup", "ABC:", description="disk")
+    result = await set_share("Backup", "ABC:", description="disk", save=True)
     assert result["added"] is True
     mock_client.rci.assert_called_once_with([
         {"cifs": {"share": {"label": "Backup", "mount": "ABC:", "description": "disk"}}},
@@ -1662,7 +1672,7 @@ async def test_delete_share_by_label(mock_client):
     mock_client.rci_get.return_value = {
         "share": [{"label": "Backup", "mount": "ABC:", "active": False}],
     }
-    result = await delete_share("Backup")
+    result = await delete_share("Backup", save=True)
     assert result["deleted"] is True
     mock_client.rci.assert_called_once_with([
         {"cifs": {"share": {"label": "Backup", "mount": "ABC:", "no": True}}},
@@ -2018,7 +2028,7 @@ async def test_get_domain_list_not_found(mock_client):
 
 async def test_set_domain_list(mock_client):
     mock_client.rci.side_effect = [FQDN_GROUPS, {}]
-    result = await set_domain_list("steam", ["steampowered.com", "newdomain.com"])
+    result = await set_domain_list("steam", ["steampowered.com", "newdomain.com"], save=True)
     assert result["count"] == 2
     assert result["key"] == "domain-list1"
 
@@ -2026,39 +2036,39 @@ async def test_set_domain_list(mock_client):
 async def test_set_domain_list_safe_mode(mock_client):
     configure(safe_mode=True)
     with pytest.raises(PermissionError):
-        await set_domain_list("steam", ["example.com"])
+        await set_domain_list("steam", ["example.com"], save=True)
 
 
 async def test_add_domains(mock_client):
     mock_client.rci.side_effect = [FQDN_GROUPS, {}]
-    result = await add_domains("steam", ["newdomain.com"])
+    result = await add_domains("steam", ["newdomain.com"], save=True)
     assert result["added"] == 1
     assert result["total"] == 3
 
 
 async def test_add_domains_deduplicates(mock_client):
     mock_client.rci.side_effect = [FQDN_GROUPS, {}]
-    result = await add_domains("steam", ["steampowered.com"])  # already exists
+    result = await add_domains("steam", ["steampowered.com"], save=True)  # already exists
     assert result["added"] == 0
     assert result["total"] == 2
 
 
 async def test_remove_domains(mock_client):
     mock_client.rci.side_effect = [FQDN_GROUPS, {}]
-    result = await remove_domains("steam", ["steampowered.com"])
+    result = await remove_domains("steam", ["steampowered.com"], save=True)
     assert result["removed"] == 1
     assert result["total"] == 1
 
 
 async def test_remove_domains_nonexistent_is_noop(mock_client):
     mock_client.rci.side_effect = [FQDN_GROUPS, {}]
-    result = await remove_domains("steam", ["notinlist.com"])
+    result = await remove_domains("steam", ["notinlist.com"], save=True)
     assert result["removed"] == 0
 
 
 async def test_create_domain_list(mock_client):
     mock_client.rci.side_effect = [FQDN_GROUPS, {}, {}]
-    result = await create_domain_list("mylist", ["example.com"])
+    result = await create_domain_list("mylist", ["example.com"], save=True)
     assert result["created"] == "mylist"
     assert result["key"] == "domain-list2"  # next unused after list0, list1
     assert result["count"] == 1
@@ -2066,7 +2076,7 @@ async def test_create_domain_list(mock_client):
 
 async def test_delete_domain_list(mock_client):
     mock_client.rci.side_effect = [FQDN_GROUPS, {}, {}]
-    result = await delete_domain_list("steam")
+    result = await delete_domain_list("steam", save=True)
     assert result["deleted"] == "steam"
     assert result["key"] == "domain-list1"
 
@@ -2074,7 +2084,7 @@ async def test_delete_domain_list(mock_client):
 async def test_delete_domain_list_safe_mode(mock_client):
     configure(safe_mode=True)
     with pytest.raises(PermissionError):
-        await delete_domain_list("steam")
+        await delete_domain_list("steam", save=True)
 
 
 # ─── static hosts ─────────────────────────────────────────────────────────────
@@ -2106,11 +2116,11 @@ async def test_list_static_hosts_sort_ip_desc(mock_client):
 async def test_add_static_host_safe_mode(mock_client):
     configure(safe_mode=True)
     with pytest.raises(PermissionError):
-        await add_static_host("router.home", "192.168.0.1")
+        await add_static_host("router.home", "192.168.0.1", save=True)
 
 
 async def test_add_static_host_sends_batch(mock_client):
-    result = await add_static_host("router.home", "192.168.0.1")
+    result = await add_static_host("router.home", "192.168.0.1", save=True)
     assert result["added"] is True
     mock_client.rci.assert_called_once_with([
         {"ip": {"host": {"domain": "router.home", "address": "192.168.0.1"}}},
@@ -2123,12 +2133,12 @@ async def test_add_static_host_raises_on_rci_error(mock_client):
         "ip": {"host": {"status": [{"status": "error", "message": "no input [http/rci]."}]}}
     }]
     with pytest.raises(RuntimeError, match="no input"):
-        await add_static_host("router.home", "192.168.0.1")
+        await add_static_host("router.home", "192.168.0.1", save=True)
 
 
 async def test_delete_static_host_by_name(mock_client):
     mock_client.rci_get.return_value = {"static_a": [{"name": "router.home", "address": "192.168.0.1"}]}
-    result = await delete_static_host("router.home")
+    result = await delete_static_host("router.home", save=True)
     assert result["deleted"] is True
     mock_client.rci.assert_called_once_with([
         {"ip": {"host": {"domain": "router.home", "address": "192.168.0.1", "no": True}}},
@@ -2166,6 +2176,7 @@ async def test_add_static_route_sends_batch(mock_client):
         "10.211.114.1",
         "ZeroTier0",
         metric=1000,
+        save=True,
     )
     assert result["added"] is True
     assert result["destination"] == "192.168.10.0/24"
@@ -2184,7 +2195,7 @@ async def test_add_static_route_sends_batch(mock_client):
 async def test_add_static_route_safe_mode(mock_client):
     configure(safe_mode=True)
     with pytest.raises(PermissionError):
-        await add_static_route("192.168.10.0/24", "10.211.114.1", "ZeroTier0")
+        await add_static_route("192.168.10.0/24", "10.211.114.1", "ZeroTier0", save=True)
 
 
 async def test_add_static_route_raises_on_rci_error(mock_client):
@@ -2192,7 +2203,7 @@ async def test_add_static_route_raises_on_rci_error(mock_client):
         "ip": {"route": {"status": [{"status": "error", "message": "no input [http/rci]."}]}}
     }]
     with pytest.raises(RuntimeError, match="no input"):
-        await add_static_route("192.168.10.0/24", "10.211.114.1", "ZeroTier0")
+        await add_static_route("192.168.10.0/24", "10.211.114.1", "ZeroTier0", save=True)
 
 
 async def test_delete_static_route_by_destination(mock_client):
@@ -2203,7 +2214,7 @@ async def test_delete_static_route_by_destination(mock_client):
         "interface": "ZeroTier0",
         "index": "abc",
     }]
-    result = await delete_static_route(destination="192.168.10.0/24")
+    result = await delete_static_route(destination="192.168.10.0/24", save=True)
     assert result["deleted"] is True
     mock_client.rci.assert_called_once_with([
         {"ip": {"route": {
@@ -2249,7 +2260,7 @@ async def test_add_dns_route(mock_client):
             {"index": "new999", "group": "domain-list1", "interface": "Wireguard0"}
         ]}}}},  # read back
     ]
-    result = await add_dns_route("steam", "Wireguard0")
+    result = await add_dns_route("steam", "Wireguard0", save=True)
     assert result["created"] is True
     assert result["index"] == "new999"
 
@@ -2257,12 +2268,12 @@ async def test_add_dns_route(mock_client):
 async def test_add_dns_route_safe_mode(mock_client):
     configure(safe_mode=True)
     with pytest.raises(PermissionError):
-        await add_dns_route("steam", "Wireguard0")
+        await add_dns_route("steam", "Wireguard0", save=True)
 
 
 async def test_delete_dns_route(mock_client):
     mock_client.rci.return_value = {}
-    result = await delete_dns_route("abc123")
+    result = await delete_dns_route("abc123", save=True)
     assert result["deleted"] is True
     assert result["index"] == "abc123"
 
@@ -2270,7 +2281,7 @@ async def test_delete_dns_route(mock_client):
 async def test_delete_dns_route_safe_mode(mock_client):
     configure(safe_mode=True)
     with pytest.raises(PermissionError):
-        await delete_dns_route("abc123")
+        await delete_dns_route("abc123", save=True)
 
 
 # ─── set_interface_state ──────────────────────────────────────────────────────

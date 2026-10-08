@@ -130,6 +130,46 @@ create_ipsec_s2s(
 - `crypto map X disable` не существует → используем `no crypto map X enable`
 - PSK никогда не возвращается (`has_psk` only); нужен `confirm=true` + writable (не safe-mode)
 
+### 0.14.0 — multi-router, txn, CLI parse, policy/FQDN sync, granular WG
+
+| Инструмент | Описание |
+|---|---|
+| `snapshot_config` / `diff_config` / `rollback_hint` / `save_config` | Снапшот redacted RC, diff, подсказки отката, **явный** save |
+| `apply_cli_batch` | baseline → parse commands → verify → rollback_on_fail; `save=False` |
+| `rci_parse_readonly` / `cli_help` / `rci_parse_write` | Whitelist parse / help без `?` / write через batch |
+| `get_policy_tables` / `diagnose_dns_proxy_route` | Таблицы 4097+, fwmark, флаг **ON_LINK_DEFAULT** |
+| `plan_fqdn_static_sync` / `apply_fqdn_static_sync` | FQDN→/32 с тегом `fqdnsync:<list>` (обход бага gateway) |
+| `create_wireguard` / `add|update|remove_wireguard_peer` | Без .conf; `connect_via` только после `cli_help` |
+| `find_leftover_interfaces` / `wireguard_handshake_check` | Пустые WG/ACL; handshake двух роутеров |
+| `get_access_list` / `add_acl_rule` / `remove_acl_rule` | Тело ACL + mutate через batch |
+| `get_interface_security` / `check_udp_listen` | security-level; UDP listen = unsupported + косвенные признаки |
+| `cross_router_reachability` | Ping с src_router; optional capture на dst |
+
+**Поведение write:** все write-tools по умолчанию `save=False`. Сохранение — `save_config(confirm=true)` или `save=true` на операции.
+
+**Multi-router (один процесс):**
+
+```bash
+export NETCRAZE_ROUTERS='{
+  "router.home": {"host":"192.168.10.1","user":"admin","password":"…",
+                  "fallback_hosts":["10.211.114.1","https://xxx.keenetic.link"]},
+  "router.websun": {"host":"192.168.1.1","user":"admin","password":"…",
+                    "fallback_hosts":["10.211.114.2"]}
+}'
+```
+
+Каждый tool принимает опциональный `router="router.home"`. `NETCRAZE_HOST` может быть `https://host:port`; `NETCRAZE_VERIFY_TLS=false` при необходимости.
+
+**403 vs auth:** `GET /auth` → 403 без `X-NDM-Challenge` = `RCI_FORBIDDEN_BY_SECURITY_LEVEL` (ACL/security-level интерфейса), не неверный пароль.
+
+### Known NDMS 5.1.6 limitations
+
+- **FQDN → ZeroTier/VPN gateway ignored:** dns-proxy route с `gateway` материализуется как `0.0.0.0/0 via 0.0.0.0 <iface>` (**ON_LINK_DEFAULT**). Workaround: `plan_fqdn_static_sync` /32.
+- **`?` help не работает** («no such command: ?») — используйте `cli_help` (`help <cmd>` + неполная команда).
+- **403 по ZeroTier** при `security-level public` / без permit в `_WEBADMIN_ZeroTier0`.
+- **L7 с роутера** (curl/tcp/exit-IP) — нет в RCI; tools честно `unsupported`.
+- **UDP listen sockets** — RCI не отдаёт; `check_udp_listen` = unsupported + косвенные признаки.
+
 ### VPN datapath diagnostics (0.13.0)
 
 | Инструмент | Статус на NDMS 5.01 |
@@ -169,6 +209,8 @@ NDMS: start=`enable`, stop=`no enable`; BPF в кавычках; pcap часто
 | `clone_ipsec` / `create_ipsec_s2s(source_name=…)` | Clone с `keep_psk`; `ike_psk` не required |
 
 **0.11.1:** `get_running_config_redacted` redact’ит `crypto ike key …`; runtime endpoints одинаковы в diagnose/get; diagnose не врёт «IKE не стартовал», если charon CONNECTING.
+
+**0.14.0:** multi-router + https/fallback; save=False default; snapshot/diff/rollback/apply_cli_batch; CLI parse/help; policy tables + ON_LINK_DEFAULT; FQDN→/32 sync; granular WireGuard; ACL/security; cross-router reachability.
 
 **0.13.1:** `get_conntrack(host/port/protocol)` + RO `get_hotspot`; pip metadata synced.
 
@@ -269,7 +311,9 @@ chmod 700 ~/.config/mcp-netcraze/run-mcp.sh
 
 ### 2. Конфиг `~/.cursor/mcp.json`
 
-Два MCP-сервера — два роутера. В `mcp.json` только путь к creds:
+**Вариант A (0.14.0) — один процесс, multi-router:** задайте `NETCRAZE_ROUTERS` (JSON) и вызывайте tools с `router="router.home"` / `router="router.websun"`.
+
+**Вариант B — два MCP-сервера** (как раньше). В `mcp.json` только путь к creds:
 
 ```json
 {
@@ -330,6 +374,17 @@ tests/
 ```bash
 pytest
 ```
+
+## Не удалось реализовать из‑за лимитов RCI (с доказательствами)
+
+| Запрос | Почему нельзя | Доказательство / обход |
+|---|---|---|
+| HTTP/TCP/exit-IP/speed с роутера | Нет `tools.curl` / `tools.tcp` на NDMS 5.01 | Live: L7 tools → `unsupported`; ping + counters + capture |
+| DNS cache inspect/flush | Часто 404 / нет стабильного RCI | Нереалистично на 5.1.6 |
+| `connect_via` без подтверждения | Синтаксис не документирован; `?` не работает | Только после `cli_help` → `supported`; иначе `not_supported` |
+| Список listening UDP sockets | RCI не отдаёт сокеты | `check_udp_listen` = unsupported + WG listen-port / port-forward / ACL |
+| Entware curl helper | Осознанный риск (shell на роутере) | Вне скоупа MCP |
+| Полный dump `show/ip/conntrack` | Текстовый шум, огромный | `get_conntrack(host/port/…)` по `show/ip/nat` |
 
 ## Лицензия
 

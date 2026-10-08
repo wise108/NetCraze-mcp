@@ -6,11 +6,14 @@ from unittest.mock import AsyncMock
 import netcraze_mcp.config as config
 import netcraze_mcp.tools.backup as backup_tools
 import netcraze_mcp.tools.capture as capture_tools
+import netcraze_mcp.tools.cli as cli_tools
 import netcraze_mcp.tools.components as components_tools
+import netcraze_mcp.tools.cross as cross_tools
 import netcraze_mcp.tools.datapath as datapath_tools
 import netcraze_mcp.tools.diagnostics as diagnostics_tools
 import netcraze_mcp.tools.dns_routes as dns_routes_tools
 import netcraze_mcp.tools.firewall as firewall_tools
+import netcraze_mcp.tools.fqdn_sync as fqdn_sync_tools
 import netcraze_mcp.tools.health as health_tools
 import netcraze_mcp.tools.ipsec as ipsec_tools
 import netcraze_mcp.tools.network as network_tools
@@ -20,6 +23,7 @@ import netcraze_mcp.tools.static_hosts as static_hosts_tools
 import netcraze_mcp.tools.static_routes as static_routes_tools
 import netcraze_mcp.tools.storage as storage_tools
 import netcraze_mcp.tools.system as system_tools
+import netcraze_mcp.tools.txn as txn_tools
 import netcraze_mcp.tools.vpn as vpn_tools
 import netcraze_mcp.tools.wan as wan_tools
 import netcraze_mcp.tools.wireguard as wireguard_tools
@@ -32,9 +36,12 @@ def reset_config(monkeypatch):
     monkeypatch.setenv("NETCRAZE_SAFE_MODE", "false")
     monkeypatch.setenv("NETCRAZE_HOST", "192.168.1.1")
     monkeypatch.setenv("NETCRAZE_PASS", "s3cret")
+    monkeypatch.delenv("NETCRAZE_ROUTERS", raising=False)
     config.configure(safe_mode=None)
+    config.load_routers(force=True)
     yield
     config.configure(safe_mode=None)
+    config.load_routers(force=True)
 
 
 class MockNetCrazeClient:
@@ -62,7 +69,9 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
         system_tools,
         backup_tools,
         capture_tools,
+        cli_tools,
         components_tools,
+        cross_tools,
         datapath_tools,
         network_tools,
         dns_routes_tools,
@@ -79,8 +88,11 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
         diagnostics_tools,
         health_tools,
         rci_access_tools,
+        txn_tools,
+        fqdn_sync_tools,
     ):
-        monkeypatch.setattr(module, "_get_client", getter)
+        if hasattr(module, "_get_client"):
+            monkeypatch.setattr(module, "_get_client", getter)
 
 
 @pytest.fixture
