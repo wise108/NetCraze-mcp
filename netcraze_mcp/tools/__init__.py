@@ -11,6 +11,7 @@ from . import (
     diagnostics,
     dns_routes,
     firewall,
+    flow,
     fqdn_sync,
     health,
     ipsec,
@@ -58,7 +59,7 @@ def _wrap_register(module) -> None:
 for _mod in (
     system, health, backup, components, network, wan, dns_routes,
     static_hosts, static_routes, storage, wireguard, ipsec, capture,
-    datapath, zerotier, vpn, policy, firewall, diagnostics, rci_access,
+    datapath, zerotier, vpn, policy, firewall, flow, diagnostics, rci_access,
     txn, cli, fqdn_sync, cross,
 ):
     _wrap_register(_mod)
@@ -83,9 +84,11 @@ def register_tools(mcp) -> None:
     vpn.register(mcp)
     policy.register(mcp)
     firewall.register(mcp)
+    flow.register(mcp)
     diagnostics.register(mcp)
     rci_access.register(mcp)
     txn.register(mcp)
     cli.register(mcp)
     fqdn_sync.register(mcp)
     cross.register(mcp)
+

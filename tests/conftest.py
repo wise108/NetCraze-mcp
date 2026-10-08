@@ -13,6 +13,7 @@ import netcraze_mcp.tools.datapath as datapath_tools
 import netcraze_mcp.tools.diagnostics as diagnostics_tools
 import netcraze_mcp.tools.dns_routes as dns_routes_tools
 import netcraze_mcp.tools.firewall as firewall_tools
+import netcraze_mcp.tools.flow as flow_tools
 import netcraze_mcp.tools.fqdn_sync as fqdn_sync_tools
 import netcraze_mcp.tools.health as health_tools
 import netcraze_mcp.tools.ipsec as ipsec_tools
@@ -85,6 +86,7 @@ def _patch_get_client(monkeypatch, client: MockNetCrazeClient) -> None:
         vpn_tools,
         policy_tools,
         firewall_tools,
+        flow_tools,
         diagnostics_tools,
         health_tools,
         rci_access_tools,

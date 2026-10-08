@@ -1988,14 +1988,18 @@ async def test_get_wan_status_returns_dict(mock_client):
 
 # ─── domain lists ────────────────────────────────────────────────────────────
 
-FQDN_GROUPS = {
-    "show": {"sc": {"object-group": {"fqdn": {
-        "domain-list0": {"description": "XEGARE", "include": [{"address": "xegare.com"}]},
-        "domain-list1": {"description": "steam",  "include": [{"address": "steampowered.com"}, {"address": "steamcommunity.com"}]},
-    }}}}
+_FQDN_MAP = {
+    "domain-list0": {"description": "XEGARE", "include": [{"address": "xegare.com"}]},
+    "domain-list1": {"description": "steam",  "include": [{"address": "steampowered.com"}, {"address": "steamcommunity.com"}]},
 }
+FQDN_GROUPS = {
+    "show": {"sc": {"object-group": {"fqdn": _FQDN_MAP}}, "rc": {"object-group": {"fqdn": _FQDN_MAP}}}
+}
+# Direct GET show/{sc|rc}/object-group/fqdn shape (0.15+)
+FQDN_MAP = _FQDN_MAP
 
 async def test_get_domain_lists(mock_client):
+    mock_client.rci_get.return_value = FQDN_MAP
     mock_client.rci.return_value = FQDN_GROUPS
     result = await get_domain_lists()
     assert len(result) == 2
@@ -2005,32 +2009,45 @@ async def test_get_domain_lists(mock_client):
     steam = next(r for r in result if r["name"] == "steam")
     assert steam["count"] == 2
     assert steam["key"] == "domain-list1"
+    assert steam["source"] in ("rc", "sc")
 
 
 async def test_get_domain_list(mock_client):
+    mock_client.rci_get.return_value = FQDN_MAP
     mock_client.rci.return_value = FQDN_GROUPS
     result = await get_domain_list("steam")
     assert result["name"] == "steam"
     assert "steampowered.com" in result["entries"]
+    assert result["source"] in ("rc", "sc")
 
 
 async def test_get_domain_list_by_key(mock_client):
+    mock_client.rci_get.return_value = FQDN_MAP
     mock_client.rci.return_value = FQDN_GROUPS
     result = await get_domain_list("domain-list1")
     assert result["name"] == "steam"
 
 
 async def test_get_domain_list_not_found(mock_client):
+    mock_client.rci_get.return_value = FQDN_MAP
     mock_client.rci.return_value = FQDN_GROUPS
     with pytest.raises(ValueError, match="not found"):
         await get_domain_list("nonexistent")
 
 
 async def test_set_domain_list(mock_client):
-    mock_client.rci.side_effect = [FQDN_GROUPS, {}]
+    after = {
+        "domain-list0": {"description": "XEGARE", "include": [{"address": "xegare.com"}]},
+        "domain-list1": {"description": "steam", "include": [
+            {"address": "steampowered.com"}, {"address": "newdomain.com"},
+        ]},
+    }
+    mock_client.rci_get.side_effect = lambda path: after if "object-group/fqdn" in path else {}
+    mock_client.rci.return_value = {}
     result = await set_domain_list("steam", ["steampowered.com", "newdomain.com"], save=True)
     assert result["count"] == 2
     assert result["key"] == "domain-list1"
+    assert result["applied_to"] == "rc"
 
 
 async def test_set_domain_list_safe_mode(mock_client):
@@ -2040,44 +2057,127 @@ async def test_set_domain_list_safe_mode(mock_client):
 
 
 async def test_add_domains(mock_client):
-    mock_client.rci.side_effect = [FQDN_GROUPS, {}]
+    state = {
+        "domain-list0": {"description": "XEGARE", "include": [{"address": "xegare.com"}]},
+        "domain-list1": {"description": "steam", "include": [
+            {"address": "steampowered.com"}, {"address": "steamcommunity.com"},
+        ]},
+    }
+
+    async def _get(path):
+        if "object-group/fqdn" in path:
+            return state
+        return {}
+
+    async def _rci(payload):
+        if isinstance(payload, list):
+            for item in payload:
+                fq = ((item.get("object-group") or {}).get("fqdn") or {}).get("domain-list1")
+                if isinstance(fq, dict) and isinstance(fq.get("include"), list):
+                    state["domain-list1"]["include"] = fq["include"]
+        return {}
+
+    mock_client.rci_get.side_effect = _get
+    mock_client.rci.side_effect = _rci
     result = await add_domains("steam", ["newdomain.com"], save=True)
     assert result["added"] == 1
     assert result["total"] == 3
+    assert result["applied_to"] == "rc"
+    assert result["persisted"] is True
 
 
 async def test_add_domains_deduplicates(mock_client):
-    mock_client.rci.side_effect = [FQDN_GROUPS, {}]
+    mock_client.rci_get.return_value = FQDN_MAP
+    mock_client.rci.return_value = {}
     result = await add_domains("steam", ["steampowered.com"], save=True)  # already exists
     assert result["added"] == 0
     assert result["total"] == 2
 
 
 async def test_remove_domains(mock_client):
-    mock_client.rci.side_effect = [FQDN_GROUPS, {}]
+    state = {
+        "domain-list0": {"description": "XEGARE", "include": [{"address": "xegare.com"}]},
+        "domain-list1": {"description": "steam", "include": [
+            {"address": "steampowered.com"}, {"address": "steamcommunity.com"},
+        ]},
+    }
+
+    async def _get(path):
+        if "object-group/fqdn" in path:
+            return state
+        return {}
+
+    async def _rci(payload):
+        if isinstance(payload, list):
+            for item in payload:
+                fq = ((item.get("object-group") or {}).get("fqdn") or {}).get("domain-list1")
+                if isinstance(fq, dict) and isinstance(fq.get("include"), list):
+                    state["domain-list1"]["include"] = fq["include"]
+        return {}
+
+    mock_client.rci_get.side_effect = _get
+    mock_client.rci.side_effect = _rci
     result = await remove_domains("steam", ["steampowered.com"], save=True)
     assert result["removed"] == 1
     assert result["total"] == 1
 
 
 async def test_remove_domains_nonexistent_is_noop(mock_client):
-    mock_client.rci.side_effect = [FQDN_GROUPS, {}]
+    mock_client.rci_get.return_value = FQDN_MAP
+    mock_client.rci.return_value = {}
     result = await remove_domains("steam", ["notinlist.com"], save=True)
     assert result["removed"] == 0
 
 
 async def test_create_domain_list(mock_client):
-    mock_client.rci.side_effect = [FQDN_GROUPS, {}, {}]
+    state = dict(FQDN_MAP)
+
+    async def _get(path):
+        if "object-group/fqdn" in path:
+            return state
+        return {}
+
+    async def _rci(payload):
+        if isinstance(payload, list):
+            for item in payload:
+                fq = (item.get("object-group") or {}).get("fqdn") or {}
+                for key, body in fq.items():
+                    if isinstance(body, dict) and "no" not in body:
+                        state[key] = body
+        return {}
+
+    mock_client.rci_get.side_effect = _get
+    mock_client.rci.side_effect = _rci
     result = await create_domain_list("mylist", ["example.com"], save=True)
-    assert result["created"] == "mylist"
+    assert result["created"] is True
+    assert result["name"] == "mylist"
     assert result["key"] == "domain-list2"  # next unused after list0, list1
     assert result["count"] == 1
+    assert result["applied_to"] == "rc"
 
 
 async def test_delete_domain_list(mock_client):
-    mock_client.rci.side_effect = [FQDN_GROUPS, {}, {}]
+    state = dict(FQDN_MAP)
+
+    async def _get(path):
+        if "object-group/fqdn" in path:
+            return state
+        return {}
+
+    async def _rci(payload):
+        if isinstance(payload, list):
+            for item in payload:
+                fq = (item.get("object-group") or {}).get("fqdn") or {}
+                for key, body in fq.items():
+                    if isinstance(body, dict) and body.get("no"):
+                        state.pop(key, None)
+        return {}
+
+    mock_client.rci_get.side_effect = _get
+    mock_client.rci.side_effect = _rci
     result = await delete_domain_list("steam", save=True)
-    assert result["deleted"] == "steam"
+    assert result["deleted"] is True
+    assert result["name"] == "steam"
     assert result["key"] == "domain-list1"
 
 
@@ -2243,6 +2343,19 @@ DNS_ROUTES_DATA = {
 
 
 async def test_get_dns_routes(mock_client):
+    routes = [
+        {"index": "abc123", "group": "domain-list1", "interface": "Wireguard0", "auto": True},
+        {"index": "def456", "group": "domain-list0", "interface": "GigabitEthernet1", "auto": False, "disable": True},
+    ]
+
+    async def _get(path):
+        if "dns-proxy/route" in path:
+            return routes
+        if "object-group/fqdn" in path:
+            return FQDN_MAP
+        return {}
+
+    mock_client.rci_get.side_effect = _get
     mock_client.rci.return_value = DNS_ROUTES_DATA
     result = await get_dns_routes()
     assert len(result) == 2
@@ -2253,16 +2366,36 @@ async def test_get_dns_routes(mock_client):
 
 
 async def test_add_dns_route(mock_client):
-    mock_client.rci.side_effect = [
-        FQDN_GROUPS,  # _resolve_list_key
-        {},           # rci batch (add + save)
-        {"show": {"sc": {"dns-proxy": {"route": [
-            {"index": "new999", "group": "domain-list1", "interface": "Wireguard0"}
-        ]}}}},  # read back
-    ]
+    routes: list[dict] = []
+
+    async def _get(path):
+        if "object-group/fqdn" in path:
+            return FQDN_MAP
+        if "dns-proxy/route" in path:
+            return list(routes)
+        return {}
+
+    async def _rci(payload):
+        if isinstance(payload, list):
+            for item in payload:
+                route = (item.get("dns-proxy") or {}).get("route")
+                if isinstance(route, dict) and not route.get("no"):
+                    routes.append({
+                        "index": "new999",
+                        "group": route.get("group"),
+                        "interface": route.get("interface"),
+                        "gateway": route.get("gateway") or "",
+                        "auto": route.get("auto"),
+                        "disable": route.get("disable", False),
+                    })
+        return {}
+
+    mock_client.rci_get.side_effect = _get
+    mock_client.rci.side_effect = _rci
     result = await add_dns_route("steam", "Wireguard0", save=True)
     assert result["created"] is True
     assert result["index"] == "new999"
+    assert result["applied_to"] == "rc"
 
 
 async def test_add_dns_route_safe_mode(mock_client):
@@ -2272,7 +2405,23 @@ async def test_add_dns_route_safe_mode(mock_client):
 
 
 async def test_delete_dns_route(mock_client):
-    mock_client.rci.return_value = {}
+    routes = [{"index": "abc123", "group": "domain-list1", "interface": "Wireguard0"}]
+
+    async def _get(path):
+        if "dns-proxy/route" in path:
+            return list(routes)
+        return {}
+
+    async def _rci(payload):
+        if isinstance(payload, list):
+            for item in payload:
+                route = (item.get("dns-proxy") or {}).get("route")
+                if isinstance(route, dict) and route.get("no"):
+                    routes[:] = [r for r in routes if r.get("index") != route.get("index")]
+        return {}
+
+    mock_client.rci_get.side_effect = _get
+    mock_client.rci.side_effect = _rci
     result = await delete_dns_route("abc123", save=True)
     assert result["deleted"] is True
     assert result["index"] == "abc123"

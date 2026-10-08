@@ -210,6 +210,10 @@ NDMS: start=`enable`, stop=`no enable`; BPF в кавычках; pcap часто
 
 **0.11.1:** `get_running_config_redacted` redact’ит `crypto ike key …`; runtime endpoints одинаковы в diagnose/get; diagnose не врёт «IKE не стартовал», если charon CONNECTING.
 
+**0.15.1:** polish live acceptance — `expected_dst_out`=iface SNAT + `gateway_configured`; one matched `policy[]` table; batch `expect=WAN`→PASS/`path=WAN` + `name`; compact `wireguard_counter_delta`.
+
+**0.15.0:** sc/rc honesty (`source`/`dirty`/`applied_to`/`persisted`); `get_domain_list` defaults to rc; `diff_sc_rc`; `explain_policy_path` / `verify_flow_path` / `verify_flow_path_batch`; `domain_list_covers_ip` + `list_dns_route_metadata`; WG `AllowedIPs` + `add_wireguard_allowed_ips` + `wireguard_counter_delta`; `get_conntrack` src+dst/path_class/watch; `probe_tcp` (ICMP+NAT only); `suggest_telegram_cidrs`; `save_config` post-check sc==rc.
+
 **0.14.0:** multi-router + https/fallback; save=False default; snapshot/diff/rollback/apply_cli_batch; CLI parse/help; policy tables + ON_LINK_DEFAULT; FQDN→/32 sync; granular WireGuard; ACL/security; cross-router reachability.
 
 **0.13.1:** `get_conntrack(host/port/protocol)` + RO `get_hotspot`; pip metadata synced.
@@ -257,7 +261,17 @@ create_ipsec_s2s → set_ipsec_state(enable) → diagnose_ipsec_bringup
 | `get_policy_routing_summary` | DNS-routes + static routes + ip rule/policy |
 | `list_firewall_rules` | access-list + security-level |
 | `list_nat_rules` | port forwards + UPnP + count conntrack (без полного dump) |
-| `get_conntrack` | фильтр live NAT sessions (host/port/protocol; без полного dump) |
+| `get_conntrack` | фильтр live NAT (host/src/dst/port/protocol/path_class/only_unreplied/group_by/watch_seconds) |
+| `explain_policy_path` | dns-proxy policy path (list hit → route → table → expected dst_out); **не** FIB-only |
+| `verify_flow_path` | одна карточка: list + NAT + AllowedIPs + handshake + verdict A–G |
+| `verify_flow_path_batch` | batch regression (Claude/YouTube→WG0, ya.ru→WAN) |
+| `diff_sc_rc` | sc≠rc для domain-lists / dns-routes / WG AllowedIPs |
+| `domain_list_covers_ip` | CIDR/IP match + linked dns-route interface |
+| `list_dns_route_metadata` | таблица list_key/name/route/iface/counts/sc_dirty |
+| `add_wireguard_allowed_ips` | additive merge AllowedIPs (reject 0.0.0.0/0) |
+| `wireguard_counter_delta` | snapshot → sleep → Δ rx/tx/handshake |
+| `probe_tcp` | ICMP+conntrack only (TCP connect unsupported on NDMS) |
+| `suggest_telegram_cidrs` | suggest-only CIDR из core.telegram.org (+ backup 95.161.64.0/20) |
 | `get_hotspot` | RO hotspot hosts (policy/access/wifi) |
 | `router_ping` / `router_traceroute` / `router_nslookup` | Диагностика с лимитами (ping count≤5; traceroute hops≤15) |
 | `get_running_config_redacted` | `show/running-config` без секретов; `filter=interface|crypto|ip|…` |
@@ -268,7 +282,9 @@ create_ipsec_s2s → set_ipsec_state(enable) → diagnose_ipsec_bringup
 
 ### Система, сеть, DNS-маршрутизация (upstream)
 
-`get_system_info`, `reboot`, `get_interfaces`, `get_interface`, `get_connected_clients`, `get_wifi_associations`, `get_speed`, `get_routes`, `get_wan_status`, `get_wan_speed`, `get_domain_lists`, `get_domain_list`, `create_domain_list`, `delete_domain_list`, `set_domain_list`, `add_domains`, `remove_domains`, `get_dns_routes`, `add_dns_route`, `delete_dns_route`, `set_interface_state`
+`get_system_info`, `reboot`, `get_interfaces`, `get_interface`, `get_connected_clients`, `get_wifi_associations`, `get_speed`, `get_routes`, `get_wan_status`, `get_wan_speed`, `get_domain_lists`, `get_domain_list` (default **rc**; `saved=true` → sc; always `source`/`dirty`), `create_domain_list`, `delete_domain_list`, `set_domain_list`, `add_domains`, `remove_domains`, `get_dns_routes`, `add_dns_route`, `delete_dns_route`, `set_interface_state`
+
+Write-tools возвращают `applied_to=rc`, `persisted`, `dirty` — `added`/`created` только если rc реально изменился. `save_config` после save проверяет sc==rc.
 
 ## Установка
 
@@ -379,12 +395,15 @@ pytest
 
 | Запрос | Почему нельзя | Доказательство / обход |
 |---|---|---|
-| HTTP/TCP/exit-IP/speed с роутера | Нет `tools.curl` / `tools.tcp` на NDMS 5.01 | Live: L7 tools → `unsupported`; ping + counters + capture |
+| HTTP/TCP/exit-IP/speed с роутера | Нет `tools.curl` / `tools.tcp` на NDMS 5.01 | Live: L7 tools → `unsupported`; `probe_tcp` = ICMP+NAT; ping + counters + capture |
+| bare IP «куда уйдёт» через `explain_route` | FIB main table ≠ dns-proxy policy | `explain_policy_path` / `verify_flow_path` |
+| SSH/tcpdump на HAPP (.254) | MCP не читает SSH-ключи | Вне скоупа; host SSH вручную |
 | DNS cache inspect/flush | Часто 404 / нет стабильного RCI | Нереалистично на 5.1.6 |
 | `connect_via` без подтверждения | Синтаксис не документирован; `?` не работает | Только после `cli_help` → `supported`; иначе `not_supported` |
 | Список listening UDP sockets | RCI не отдаёт сокеты | `check_udp_listen` = unsupported + WG listen-port / port-forward / ACL |
 | Entware curl helper | Осознанный риск (shell на роутере) | Вне скоупа MCP |
-| Полный dump `show/ip/conntrack` | Текстовый шум, огромный | `get_conntrack(host/port/…)` по `show/ip/nat` |
+| Полный dump `show/ip/conntrack` | Текстовый шум, огромный | `get_conntrack(host/src/dst/port/…)` по `show/ip/nat` |
+| auto-apply Telegram CIDR | Только suggest | `suggest_telegram_cidrs` → ручной `add_domains` + `add_wireguard_allowed_ips` |
 
 ## Лицензия
 
