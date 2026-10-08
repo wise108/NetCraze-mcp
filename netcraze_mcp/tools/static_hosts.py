@@ -4,7 +4,7 @@ import ipaddress
 import re
 
 from ..client import _get_client, _raise_on_rci_errors
-from ..config import assert_writable
+from ..config import assert_writable, save_payload
 
 
 def _is_private_ip(value: str) -> bool:
@@ -89,8 +89,8 @@ async def list_static_hosts(sort_by: str = "", order: str = "asc") -> list[dict]
     return entries
 
 
-async def add_static_host(host: str, ip: str) -> dict:
-    """Add static DNS host and save configuration."""
+async def add_static_host(host: str, ip: str, save: bool = False) -> dict:
+    """Add static DNS host. save=False by default."""
     assert_writable()
     if not _is_private_ip(ip):
         raise ValueError("Only private IPv4 addresses are allowed.")
@@ -98,14 +98,14 @@ async def add_static_host(host: str, ip: str) -> dict:
         # NetCraze RCI expects domain+address (name+address → silent "no input")
         resp = await client.rci([
             {"ip": {"host": {"domain": host, "address": ip}}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
         _raise_on_rci_errors(resp)
-    return {"added": True, "host": host, "ip": ip}
+    return {"added": True, "host": host, "ip": ip, "config_saved": save}
 
 
-async def delete_static_host(host: str) -> dict:
-    """Delete static DNS host by name and save configuration."""
+async def delete_static_host(host: str, save: bool = False) -> dict:
+    """Delete static DNS host by name. save=False by default."""
     assert_writable()
     entries = await list_static_hosts()
     ip = next((entry["ip"] for entry in entries if entry["host"] == host), "")
@@ -114,10 +114,10 @@ async def delete_static_host(host: str) -> dict:
     async with _get_client() as client:
         resp = await client.rci([
             {"ip": {"host": {"domain": host, "address": ip, "no": True}}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
         _raise_on_rci_errors(resp)
-    return {"deleted": True, "host": host, "ip": ip}
+    return {"deleted": True, "host": host, "ip": ip, "config_saved": save}
 
 
 def register(mcp) -> None:

@@ -3,7 +3,7 @@
 import ipaddress
 
 from ..client import _get_client, _raise_on_rci_errors
-from ..config import assert_writable
+from ..config import assert_writable, save_payload
 
 
 def _parse_destination(destination: str) -> dict:
@@ -57,8 +57,10 @@ async def add_static_route(
     gateway: str,
     interface: str,
     metric: int | None = None,
+    comment: str = "",
+    save: bool = False,
 ) -> dict:
-    """Add static IP route and save configuration."""
+    """Add static IP route. save=False by default — call save_config to persist."""
     assert_writable()
     parsed = _parse_destination(destination)
     if not gateway:
@@ -73,10 +75,12 @@ async def add_static_route(
     }
     if metric is not None:
         payload["metric"] = metric
+    if comment.strip():
+        payload["comment"] = comment.strip()
     async with _get_client() as client:
         resp = await client.rci([
             {"ip": {"route": payload}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
         _raise_on_rci_errors(resp)
     return {
@@ -84,12 +88,18 @@ async def add_static_route(
         "destination": parsed["destination"],
         "gateway": gateway,
         "interface": interface,
+        "config_saved": save,
         **({"metric": metric} if metric is not None else {}),
+        **({"comment": comment.strip()} if comment.strip() else {}),
     }
 
 
-async def delete_static_route(destination: str = "", index: str = "") -> dict:
-    """Delete static IP route by destination CIDR or config index, then save."""
+async def delete_static_route(
+    destination: str = "",
+    index: str = "",
+    save: bool = False,
+) -> dict:
+    """Delete static IP route by destination CIDR or config index."""
     assert_writable()
     if not destination and not index:
         raise ValueError("Specify destination CIDR or index")
@@ -110,10 +120,14 @@ async def delete_static_route(destination: str = "", index: str = "") -> dict:
                 "mask": match["mask"],
                 "no": True,
             }}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
         _raise_on_rci_errors(resp)
-    return {"deleted": True, **{k: match[k] for k in ("destination", "gateway", "interface", "index") if k in match}}
+    return {
+        "deleted": True,
+        "config_saved": save,
+        **{k: match[k] for k in ("destination", "gateway", "interface", "index") if k in match},
+    }
 
 
 def register(mcp) -> None:

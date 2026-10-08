@@ -1284,7 +1284,7 @@ async def create_ipsec_s2s(
     passive: bool = False,
     force_encaps: bool | None = None,
     enable: bool = True,
-    save: bool = True,
+    save: bool = False,
     confirm: bool = False,
 ) -> dict:
     """Create or update one IPsec S2S profile (idempotent by name). Requires confirm=true.
@@ -1433,7 +1433,7 @@ async def update_ipsec_s2s(
     passive: bool | None = None,
     force_encaps: bool | None = None,
     enable: bool | None = None,
-    save: bool = True,
+    save: bool = False,
     confirm: bool = False,
 ) -> dict:
     """Full-replace update of an existing S2S profile (read-modify-write). Requires confirm=true.
@@ -1526,7 +1526,7 @@ async def update_ipsec_s2s(
 async def set_ipsec_state(
     name: str,
     enabled: bool,
-    save: bool = True,
+    save: bool = False,
     confirm: bool = False,
 ) -> dict:
     """Enable/disable IPsec crypto map via parse only. Requires confirm=true.
@@ -1579,7 +1579,7 @@ async def set_ipsec_state(
 
 async def delete_ipsec(
     name: str,
-    save: bool = True,
+    save: bool = False,
     confirm: bool = False,
 ) -> dict:
     """Delete IPsec S2S profile. Requires confirm=true.
@@ -1626,7 +1626,7 @@ async def delete_ipsec(
 async def rename_ipsec(
     old_name: str,
     new_name: str,
-    save: bool = True,
+    save: bool = False,
     confirm: bool = False,
 ) -> dict:
     """Rename IPsec S2S by clone+delete using PSK only in memory. Requires confirm=true.
@@ -1732,7 +1732,7 @@ async def clone_ipsec(
     local_networks: str | list[str] = "",
     remote_networks: str | list[str] = "",
     enable: bool = True,
-    save: bool = True,
+    save: bool = False,
     confirm: bool = False,
 ) -> dict:
     """Clone IPsec S2S profile (PSK copied in memory only). Requires confirm=true.

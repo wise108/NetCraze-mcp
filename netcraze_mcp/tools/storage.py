@@ -1,7 +1,7 @@
 """USB storage, SMB shares and printer tools."""
 
 from ..client import _get_client, _raise_on_rci_errors
-from ..config import assert_writable
+from ..config import assert_writable, save_payload
 
 
 def _as_int(value):
@@ -243,8 +243,8 @@ async def list_printers() -> list[dict]:
     return result
 
 
-async def set_share(label: str, mount: str, description: str = "") -> dict:
-    """Create or update SMB/CIFS share and save configuration."""
+async def set_share(label: str, mount: str, description: str = "", save: bool = False) -> dict:
+    """Create or update SMB/CIFS share. save=False by default."""
     assert_writable()
     if not label.strip() or not mount.strip():
         raise ValueError("label and mount are required")
@@ -254,14 +254,14 @@ async def set_share(label: str, mount: str, description: str = "") -> dict:
     async with _get_client() as client:
         resp = await client.rci([
             {"cifs": {"share": share}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
         _raise_on_rci_errors(resp)
-    return {"added": True, **share}
+    return {"added": True, "config_saved": save, **share}
 
 
-async def delete_share(label: str) -> dict:
-    """Delete SMB/CIFS share by label and save configuration."""
+async def delete_share(label: str, save: bool = False) -> dict:
+    """Delete SMB/CIFS share by label. save=False by default."""
     assert_writable()
     if not label.strip():
         raise ValueError("label is required")
@@ -276,10 +276,15 @@ async def delete_share(label: str) -> dict:
                 "mount": match["mount"],
                 "no": True,
             }}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
         _raise_on_rci_errors(resp)
-    return {"deleted": True, "label": match["label"], "mount": match["mount"]}
+    return {
+        "deleted": True,
+        "label": match["label"],
+        "mount": match["mount"],
+        "config_saved": save,
+    }
 
 
 async def unmount_usb(device: str) -> dict:

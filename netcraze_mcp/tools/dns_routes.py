@@ -1,7 +1,7 @@
 """DNS routing and domain list tools."""
 
 from ..client import _get_client
-from ..config import assert_writable
+from ..config import assert_writable, save_payload
 
 
 async def _fetch_fqdn_groups(client) -> dict[str, dict]:
@@ -32,14 +32,16 @@ async def _read_list_entries(client, key: str, groups: dict | None = None) -> tu
     return description, [entry["address"] for entry in raw if isinstance(entry, dict) and entry.get("address")]
 
 
-async def _write_list_entries(client, key: str, description: str, entries: list[str]) -> None:
+async def _write_list_entries(
+    client, key: str, description: str, entries: list[str], *, save: bool = False
+) -> None:
     await client.rci([
         {"object-group": {"fqdn": {key: {"include": {"no": True}}}}},
         {"object-group": {"fqdn": {key: {
             "description": description,
             "include": [{"address": entry} for entry in entries],
         }}}},
-        {"system": {"configuration": {"save": {}}}},
+        *save_payload(save),
     ])
 
 
@@ -95,6 +97,7 @@ async def add_dns_route(
     gateway: str = "",
     auto: bool = True,
     enabled: bool = True,
+    save: bool = False,
 ) -> dict:
     assert_writable()
     async with _get_client() as client:
@@ -107,7 +110,7 @@ async def add_dns_route(
                 "auto": auto,
                 "disable": not enabled,
             }}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
         routes_data = await client.rci({"show": {"sc": {"dns-proxy": {"route": {}}}}})
     routes = routes_data.get("show", {}).get("sc", {}).get("dns-proxy", {}).get("route", [])
@@ -115,53 +118,71 @@ async def add_dns_route(
         routes = [routes] if routes else []
     for route in reversed(routes):
         if route.get("group") == key and route.get("interface") == interface:
-            return {"created": True, "index": route.get("index"), "list_name": list_name, "interface": interface}
-    return {"created": True, "list_name": list_name, "interface": interface}
+            return {
+                "created": True,
+                "index": route.get("index"),
+                "list_name": list_name,
+                "interface": interface,
+                "config_saved": save,
+            }
+    return {"created": True, "list_name": list_name, "interface": interface, "config_saved": save}
 
 
-async def delete_dns_route(index: str) -> dict:
+async def delete_dns_route(index: str, save: bool = False) -> dict:
     assert_writable()
     async with _get_client() as client:
         await client.rci([
             {"dns-proxy": {"route": {"index": index, "no": True}}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
-        return {"deleted": True, "index": index}
+        return {"deleted": True, "index": index, "config_saved": save}
 
 
-async def set_domain_list(name: str, entries: list[str]) -> dict:
+async def set_domain_list(name: str, entries: list[str], save: bool = False) -> dict:
     assert_writable()
     async with _get_client() as client:
         groups = await _fetch_fqdn_groups(client)
         key = await _resolve_list_key(client, name, groups)
         description, _ = await _read_list_entries(client, key, groups)
-        await _write_list_entries(client, key, description, entries)
-        return {"updated": description, "key": key, "count": len(entries)}
+        await _write_list_entries(client, key, description, entries, save=save)
+        return {"updated": description, "key": key, "count": len(entries), "config_saved": save}
 
 
-async def add_domains(name: str, domains: list[str]) -> dict:
+async def add_domains(name: str, domains: list[str], save: bool = False) -> dict:
     assert_writable()
     async with _get_client() as client:
         groups = await _fetch_fqdn_groups(client)
         key = await _resolve_list_key(client, name, groups)
         description, existing = await _read_list_entries(client, key, groups)
         merged = list(dict.fromkeys(existing + [domain for domain in domains if domain not in existing]))
-        await _write_list_entries(client, key, description, merged)
-        return {"updated": description, "key": key, "added": len(merged) - len(existing), "total": len(merged)}
+        await _write_list_entries(client, key, description, merged, save=save)
+        return {
+            "updated": description,
+            "key": key,
+            "added": len(merged) - len(existing),
+            "total": len(merged),
+            "config_saved": save,
+        }
 
 
-async def remove_domains(name: str, domains: list[str]) -> dict:
+async def remove_domains(name: str, domains: list[str], save: bool = False) -> dict:
     assert_writable()
     async with _get_client() as client:
         groups = await _fetch_fqdn_groups(client)
         key = await _resolve_list_key(client, name, groups)
         description, existing = await _read_list_entries(client, key, groups)
         filtered = [entry for entry in existing if entry not in set(domains)]
-        await _write_list_entries(client, key, description, filtered)
-        return {"updated": description, "key": key, "removed": len(existing) - len(filtered), "total": len(filtered)}
+        await _write_list_entries(client, key, description, filtered, save=save)
+        return {
+            "updated": description,
+            "key": key,
+            "removed": len(existing) - len(filtered),
+            "total": len(filtered),
+            "config_saved": save,
+        }
 
 
-async def create_domain_list(name: str, entries: list[str] | None = None) -> dict:
+async def create_domain_list(name: str, entries: list[str] | None = None, save: bool = False) -> dict:
     assert_writable()
     async with _get_client() as client:
         groups = await _fetch_fqdn_groups(client)
@@ -175,20 +196,20 @@ async def create_domain_list(name: str, entries: list[str] | None = None) -> dic
                 "description": name,
                 "include": [{"address": entry} for entry in (entries or [])],
             }}}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
-        return {"created": name, "key": key, "count": len(entries or [])}
+        return {"created": name, "key": key, "count": len(entries or []), "config_saved": save}
 
 
-async def delete_domain_list(name: str) -> dict:
+async def delete_domain_list(name: str, save: bool = False) -> dict:
     assert_writable()
     async with _get_client() as client:
         key = await _resolve_list_key(client, name)
         await client.rci([
             {"object-group": {"fqdn": {key: {"no": True}}}},
-            {"system": {"configuration": {"save": {}}}},
+            *save_payload(save),
         ])
-        return {"deleted": name, "key": key}
+        return {"deleted": name, "key": key, "config_saved": save}
 
 
 def register(mcp) -> None:
