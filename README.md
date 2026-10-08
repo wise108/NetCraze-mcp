@@ -135,7 +135,8 @@ create_ipsec_s2s(
 | Инструмент | Описание |
 |---|---|
 | `snapshot_config` / `diff_config` / `rollback_hint` / `save_config` | Снапшот redacted RC, diff, подсказки отката, **явный** save |
-| `apply_cli_batch` | baseline → parse commands → verify → rollback_on_fail; `save=False` |
+| `apply_cli_batch` | baseline → parse (interface **submode sessions**) → verify; `rollback_on_fail=false` by default; **never** auto `no interface …` |
+| `set_interface_tcp_adjust_mss` | Structured RCI MSS clamp (`pmtu`/`disable`) — prefer over CLI |
 | `rci_parse_readonly` / `cli_help` / `rci_parse_write` | Whitelist parse / help без `?` / write через batch |
 | `get_policy_tables` / `diagnose_dns_proxy_route` | Таблицы 4097+, fwmark, флаг **ON_LINK_DEFAULT** |
 | `plan_fqdn_static_sync` / `apply_fqdn_static_sync` | FQDN→/32 с тегом `fqdnsync:<list>` (обход бага gateway) |
@@ -209,6 +210,8 @@ NDMS: start=`enable`, stop=`no enable`; BPF в кавычках; pcap часто
 | `clone_ipsec` / `create_ipsec_s2s(source_name=…)` | Clone с `keep_psk`; `ike_psk` не required |
 
 **0.11.1:** `get_running_config_redacted` redact’ит `crypto ike key …`; runtime endpoints одинаковы в diagnose/get; diagnose не врёт «IKE не стартовал», если charon CONNECTING.
+
+**0.15.2:** CLI safety — deny-list `no interface` rollback; `rollback_on_fail` default false; interface submode sessions; `set_interface_tcp_adjust_mss` via RCI (incident: MSS clamp must not delete WG).
 
 **0.15.1:** polish live acceptance — `expected_dst_out`=iface SNAT + `gateway_configured`; one matched `policy[]` table; batch `expect=WAN`→PASS/`path=WAN` + `name`; compact `wireguard_counter_delta`.
 
@@ -404,6 +407,7 @@ pytest
 | Entware curl helper | Осознанный риск (shell на роутере) | Вне скоупа MCP |
 | Полный dump `show/ip/conntrack` | Текстовый шум, огромный | `get_conntrack(host/src/dst/port/…)` по `show/ip/nat` |
 | auto-apply Telegram CIDR | Только suggest | `suggest_telegram_cidrs` → ручной `add_domains` + `add_wireguard_allowed_ips` |
+| CLI rollback `no interface X` | Удаляет весь интерфейс | Deny-list; `failed_needs_manual_restore` + `baseline_id`; MSS → `set_interface_tcp_adjust_mss` |
 
 ## Лицензия
 
