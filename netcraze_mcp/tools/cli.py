@@ -161,9 +161,12 @@ async def rci_parse_write(
     confirm: bool = False,
     save: bool = False,
     verify: list[str] | None = None,
-    rollback_on_fail: bool = True,
+    rollback_on_fail: bool = False,
 ) -> dict:
-    """Mutating parse commands via apply_cli_batch. Requires confirm=true."""
+    """Mutating parse commands via apply_cli_batch. Requires confirm=true.
+
+    rollback_on_fail defaults false — never auto-deletes interfaces on failure.
+    """
     assert_writable()
     return await apply_cli_batch(
         commands=commands,
