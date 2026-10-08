@@ -135,20 +135,39 @@ def _wg_summary(iface: dict) -> dict:
     }
 
 
-def _wg_details(iface: dict) -> dict:
+def _wg_details(iface: dict, *, cfg_peers: list[dict] | None = None, sc_peers: list[dict] | None = None, source: str = "live") -> dict:
+    from . import sc_rc
+
     summary = _wg_summary(iface)
     wg = iface.get("wireguard") or {}
     peers_raw = wg.get("peer") or []
     if isinstance(peers_raw, dict):
         peers_raw = list(peers_raw.values())
+    cfg_by_key: dict[str, dict] = {}
+    for peer in cfg_peers or []:
+        pk = str(peer.get("key") or peer.get("public-key") or "")
+        if pk:
+            cfg_by_key[pk] = peer
+    sc_by_key: dict[str, dict] = {}
+    for peer in sc_peers or []:
+        pk = str(peer.get("key") or peer.get("public-key") or "")
+        if pk:
+            sc_by_key[pk] = peer
     peers = []
+    dirty_any = False
     for peer in peers_raw if isinstance(peers_raw, list) else []:
         if not isinstance(peer, dict):
             continue
+        pk = str(peer.get("public-key") or peer.get("key") or "")
+        cfg = cfg_by_key.get(pk) or peer
+        allowed = sc_rc.allow_ips_from_peer(cfg)
+        sc_allowed = sc_rc.allow_ips_from_peer(sc_by_key.get(pk) or {}) if sc_by_key else allowed
+        peer_dirty = sorted(allowed) != sorted(sc_allowed) if sc_by_key else False
+        dirty_any = dirty_any or peer_dirty
         peers.append({
             key: value
             for key, value in {
-                "public_key": peer.get("public-key") or peer.get("key"),
+                "public_key": pk or None,
                 "endpoint": (
                     f"{peer.get('remote-endpoint-address')}:{peer.get('remote-port')}"
                     if peer.get("remote-endpoint-address") and peer.get("remote-port")
@@ -159,12 +178,33 @@ def _wg_details(iface: dict) -> dict:
                 "last_handshake": peer.get("last-handshake"),
                 "rx_bytes": peer.get("rxbytes"),
                 "tx_bytes": peer.get("txbytes"),
+                "allowed_ips": allowed,
+                "allow_ips": allowed,
+                "source": source,
+                "dirty": peer_dirty,
             }.items()
             if value is not None
+        })
+    # peers present only in rc config (no live handshake yet)
+    for pk, cfg in cfg_by_key.items():
+        if any(p.get("public_key") == pk for p in peers):
+            continue
+        allowed = sc_rc.allow_ips_from_peer(cfg)
+        sc_allowed = sc_rc.allow_ips_from_peer(sc_by_key.get(pk) or {}) if sc_by_key else allowed
+        peer_dirty = sorted(allowed) != sorted(sc_allowed) if sc_by_key else False
+        dirty_any = dirty_any or peer_dirty
+        peers.append({
+            "public_key": pk,
+            "allowed_ips": allowed,
+            "allow_ips": allowed,
+            "source": source,
+            "dirty": peer_dirty,
         })
     if peers:
         summary["peers"] = peers
     summary["public_key"] = wg.get("public-key")
+    summary["source"] = source
+    summary["dirty"] = dirty_any
     return {k: v for k, v in summary.items() if v is not None}
 
 
@@ -190,23 +230,74 @@ async def list_wireguard() -> list[dict]:
     return result
 
 
-async def get_wireguard(interface_id: str) -> dict:
-    """Get one WireGuard interface; private/preshared keys are never returned."""
+async def get_wireguard(interface_id: str, saved: bool = False) -> dict:
+    """Get one WireGuard interface including AllowedIPs from rc (default) or sc.
+
+    Limitation: private/preshared keys are never returned. After write without save,
+    source=rc reflects running peers; dirty=true means sc≠rc AllowedIPs.
+    """
     if not interface_id.strip():
         raise ValueError("interface_id is required")
     needle = interface_id.strip()
+    prefer = "sc" if saved else "rc"
     async with _get_client() as client:
         try:
             data = await client.rci_get(f"show/interface/{needle}")
         except Exception:  # noqa: BLE001
             data = None
-        if isinstance(data, dict) and data and (not data.get("type") or data.get("type") == "Wireguard"):
-            if data.get("type") == "Wireguard" or "wireguard" in data:
-                return _wg_details(data)
-        for item in await _fetch_wg_ifaces(client):
-            if (item.get("id") or item.get("interface-name")) == needle:
-                return _wg_details(item)
-    raise ValueError(f"Interface not found: {interface_id}")
+        live = None
+        if isinstance(data, dict) and data and (data.get("type") == "Wireguard" or "wireguard" in data):
+            live = data
+        if live is None:
+            for item in await _fetch_wg_ifaces(client):
+                if (item.get("id") or item.get("interface-name")) == needle:
+                    live = item
+                    break
+        if live is None:
+            raise ValueError(f"Interface not found: {interface_id}")
+        cfg = {}
+        sc_cfg = {}
+        for path, slot in (
+            (f"show/{prefer}/interface/{needle}", "prefer"),
+            (f"show/sc/interface/{needle}", "sc"),
+            (f"show/rc/interface/{needle}", "rc"),
+        ):
+            try:
+                blob = await client.rci_get(path)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(blob, dict) or not blob:
+                continue
+            if slot == "prefer":
+                cfg = blob
+            elif slot == "sc":
+                sc_cfg = blob
+            elif slot == "rc" and prefer == "rc" and not cfg:
+                cfg = blob
+            elif slot == "rc" and prefer == "sc":
+                pass
+        if prefer == "rc" and not cfg:
+            cfg = sc_cfg or {}
+        if prefer == "sc" and not sc_cfg:
+            sc_cfg = cfg
+        # when prefer=rc, sc_cfg for dirty; when prefer=sc, also need rc for dirty
+        if prefer == "sc" and not cfg:
+            try:
+                cfg = await client.rci_get(f"show/sc/interface/{needle}")
+            except Exception:  # noqa: BLE001
+                cfg = {}
+        other = sc_cfg
+        if prefer == "sc":
+            try:
+                other = await client.rci_get(f"show/rc/interface/{needle}")
+            except Exception:  # noqa: BLE001
+                other = {}
+            cfg_peers = _peers_from_rc(cfg if isinstance(cfg, dict) else {})
+            other_peers = _peers_from_rc(other if isinstance(other, dict) else {})
+            return _wg_details(live, cfg_peers=cfg_peers, sc_peers=other_peers, source="sc")
+        cfg_peers = _peers_from_rc(cfg if isinstance(cfg, dict) else {})
+        sc_peers = _peers_from_rc(sc_cfg if isinstance(sc_cfg, dict) else {})
+        return _wg_details(live, cfg_peers=cfg_peers, sc_peers=sc_peers, source="rc")
 
 
 def _handshake_age(value: Any) -> int | None:
@@ -739,21 +830,236 @@ async def update_wireguard_peer(
             existing=existing_peer,
         )
         # explicit remove then add — NDMS append-on-write can otherwise duplicate
+        from . import sc_rc
+
+        before_allow = sc_rc.allow_ips_from_peer(existing_peer)
         resp = await client.rci([
             {"interface": {iface_id: {"wireguard": {"peer": [{"key": pub, "no": True}]}}}},
             {"interface": {iface_id: {"wireguard": {"peer": [peer]}}}},
             *save_payload(save),
         ])
         _raise_on_rci_errors(resp)
+        after_rc = await client.rci_get(f"show/rc/interface/{iface_id}")
+        after_peer = next(
+            (p for p in _peers_from_rc(after_rc if isinstance(after_rc, dict) else {})
+             if str(p.get("key") or p.get("public-key") or "") == pub),
+            None,
+        )
+        after_allow = sc_rc.allow_ips_from_peer(after_peer or {}) if after_peer else allow
+        sc_blob = {}
+        try:
+            sc_blob = await client.rci_get(f"show/sc/interface/{iface_id}")
+        except Exception:  # noqa: BLE001
+            sc_blob = {}
+        sc_peer = next(
+            (p for p in _peers_from_rc(sc_blob if isinstance(sc_blob, dict) else {})
+             if str(p.get("key") or p.get("public-key") or "") == pub),
+            None,
+        )
+        sc_allow = sc_rc.allow_ips_from_peer(sc_peer or {})
     return {
         "ok": True,
         "updated": True,
         "id": iface_id,
         "peer_public_key": pub,
-        "allowed_ips": allow,
+        "allowed_ips": after_allow,
+        "added": sorted(set(after_allow) - set(before_allow)),
+        "removed": sorted(set(before_allow) - set(after_allow)),
+        "unchanged": sorted(set(before_allow) & set(after_allow)),
+        "count": len(after_allow),
         "endpoint": endpoint.strip() or (peer.get("endpoint") or {}).get("address"),
         "connect_via": (peer.get("connect") or {}).get("via"),
+        "applied_to": "rc",
+        "persisted": bool(save),
+        "dirty": sorted(after_allow) != sorted(sc_allow),
+        "sc_dirty": sorted(after_allow) != sorted(sc_allow),
         "config_saved": save,
+    }
+
+
+async def add_wireguard_allowed_ips(
+    interface: str,
+    peer_pubkey: str,
+    cidrs: list[str],
+    confirm: bool = False,
+    save: bool = False,
+    allow_default_route: bool = False,
+) -> dict:
+    """Additive merge of AllowedIPs for one peer (no full-list rewrite required).
+
+    Rejects 0.0.0.0/0 unless allow_default_route=true. Returns added/removed/unchanged/count/dirty.
+    """
+    from . import sc_rc
+
+    assert_writable()
+    if not confirm:
+        raise PermissionError("confirm=true is required")
+    iface_id = (interface or "").strip()
+    pub = (peer_pubkey or "").strip()
+    if not iface_id or not pub:
+        raise ValueError("interface and peer_pubkey are required")
+    incoming = []
+    for raw in cidrs or []:
+        text = str(raw).strip()
+        if not text:
+            continue
+        net = ipaddress.ip_network(text, strict=False)
+        if net.prefixlen == 0 and not allow_default_route:
+            raise ValueError(
+                "refusing 0.0.0.0/0 (or ::/0); pass allow_default_route=true to confirm"
+            )
+        incoming.append(str(net))
+    if not incoming:
+        raise ValueError("cidrs must contain at least one CIDR")
+
+    async with _get_client() as client:
+        rc = await client.rci_get(f"show/rc/interface/{iface_id}")
+        if not isinstance(rc, dict) or not rc:
+            raise ValueError(f"WireGuard interface not found: {iface_id}")
+        existing_peer = None
+        for item in _peers_from_rc(rc):
+            if str(item.get("key") or item.get("public-key") or "") == pub:
+                existing_peer = item
+                break
+        if existing_peer is None:
+            raise ValueError(f"peer not found on {iface_id}: {pub[:12]}…")
+        before = sc_rc.allow_ips_from_peer(existing_peer)
+        before_set = set(before)
+        added = [c for c in incoming if c not in before_set]
+        merged = list(dict.fromkeys([*before, *incoming]))
+        if not added:
+            sc = {}
+            try:
+                sc = await client.rci_get(f"show/sc/interface/{iface_id}")
+            except Exception:  # noqa: BLE001
+                sc = {}
+            sc_peer = next(
+                (p for p in _peers_from_rc(sc if isinstance(sc, dict) else {})
+                 if str(p.get("key") or p.get("public-key") or "") == pub),
+                None,
+            )
+            sc_allow = sc_rc.allow_ips_from_peer(sc_peer or {})
+            return {
+                "ok": True,
+                "id": iface_id,
+                "peer_public_key": pub,
+                "added": [],
+                "removed": [],
+                "unchanged": before,
+                "count": len(before),
+                "applied_to": "rc",
+                "persisted": bool(save),
+                "dirty": sorted(before) != sorted(sc_allow),
+                "sc_dirty": sorted(before) != sorted(sc_allow),
+                "config_saved": save,
+                "note": "no-op: all cidrs already present in running-config",
+            }
+        peer = _build_wg_peer_payload(
+            public_key=pub,
+            allowed_ips=merged,
+            existing=existing_peer,
+        )
+        resp = await client.rci([
+            {"interface": {iface_id: {"wireguard": {"peer": [{"key": pub, "no": True}]}}}},
+            {"interface": {iface_id: {"wireguard": {"peer": [peer]}}}},
+            *save_payload(save),
+        ])
+        _raise_on_rci_errors(resp)
+        after_rc = await client.rci_get(f"show/rc/interface/{iface_id}")
+        after_peer = next(
+            (p for p in _peers_from_rc(after_rc if isinstance(after_rc, dict) else {})
+             if str(p.get("key") or p.get("public-key") or "") == pub),
+            None,
+        )
+        after = sc_rc.allow_ips_from_peer(after_peer or {})
+        sc = {}
+        try:
+            sc = await client.rci_get(f"show/sc/interface/{iface_id}")
+        except Exception:  # noqa: BLE001
+            sc = {}
+        sc_peer = next(
+            (p for p in _peers_from_rc(sc if isinstance(sc, dict) else {})
+             if str(p.get("key") or p.get("public-key") or "") == pub),
+            None,
+        )
+        sc_allow = sc_rc.allow_ips_from_peer(sc_peer or {})
+    actually_added = [c for c in added if c in after]
+    removed = sorted(set(before) - set(after))
+    unchanged = [c for c in before if c in after]
+    return {
+        "ok": True,
+        "id": iface_id,
+        "peer_public_key": pub,
+        "added": actually_added,
+        "removed": removed,
+        "unchanged": unchanged,
+        "count": len(after),
+        "allowed_ips": after,
+        "applied_to": "rc",
+        "persisted": bool(save),
+        "dirty": sorted(after) != sorted(sc_allow),
+        "sc_dirty": sorted(after) != sorted(sc_allow),
+        "config_saved": save,
+        "note": "additive merge; removed should be empty unless NDMS dropped entries",
+    }
+
+
+def _wg_runtime_summary(rt: dict) -> dict:
+    """Compact counters without AllowedIPs / full peer blobs."""
+    peers = rt.get("peers") or []
+    return {
+        key: value
+        for key, value in {
+            "id": rt.get("id"),
+            "ok": rt.get("ok"),
+            "peer_online": rt.get("peer_online"),
+            "peer_count": len(peers) if isinstance(peers, list) else 0,
+            "latest_handshake_age_sec": rt.get("latest_handshake_age_sec"),
+            "transfer_rx_bytes": rt.get("transfer_rx_bytes"),
+            "transfer_tx_bytes": rt.get("transfer_tx_bytes"),
+        }.items()
+        if value is not None
+    }
+
+
+async def wireguard_counter_delta(interface: str, sleep_sec: float = 3.0) -> dict:
+    """Snapshot WG peer rx/tx/handshake → wait → delta (read-only).
+
+    Returns summary + deltas only — not full before/after AllowedIPs payloads.
+    """
+    import asyncio
+
+    iface = (interface or "").strip()
+    if not iface:
+        raise ValueError("interface is required")
+    wait = max(0.5, float(sleep_sec))
+    before = await get_wireguard_runtime(iface)
+    await asyncio.sleep(wait)
+    after = await get_wireguard_runtime(iface)
+    peers_b = {(p.get("public_key") or ""): p for p in (before.get("peers") or [])}
+    peers_a = {(p.get("public_key") or ""): p for p in (after.get("peers") or [])}
+    deltas = []
+    for pk in sorted(set(peers_b) | set(peers_a)):
+        b = peers_b.get(pk) or {}
+        a = peers_a.get(pk) or {}
+        deltas.append({
+            "public_key": pk[:16] + "…" if len(pk) > 16 else pk,
+            "rx_delta": int(a.get("transfer_rx_bytes") or 0) - int(b.get("transfer_rx_bytes") or 0),
+            "tx_delta": int(a.get("transfer_tx_bytes") or 0) - int(b.get("transfer_tx_bytes") or 0),
+            "handshake_age_before": b.get("latest_handshake_age_sec"),
+            "handshake_age_after": a.get("latest_handshake_age_sec"),
+            "peer_online_before": b.get("peer_online"),
+            "peer_online_after": a.get("peer_online"),
+        })
+    return {
+        "ok": True,
+        "interface": iface,
+        "sleep_sec": wait,
+        "rx_delta": int(after.get("transfer_rx_bytes") or 0) - int(before.get("transfer_rx_bytes") or 0),
+        "tx_delta": int(after.get("transfer_tx_bytes") or 0) - int(before.get("transfer_tx_bytes") or 0),
+        "peers": deltas,
+        "before_summary": _wg_runtime_summary(before),
+        "after_summary": _wg_runtime_summary(after),
     }
 
 
@@ -927,6 +1233,8 @@ def register(mcp) -> None:
     mcp.tool()(create_wireguard)
     mcp.tool()(add_wireguard_peer)
     mcp.tool()(update_wireguard_peer)
+    mcp.tool()(add_wireguard_allowed_ips)
     mcp.tool()(remove_wireguard_peer)
     mcp.tool()(find_leftover_interfaces)
     mcp.tool()(wireguard_handshake_check)
+    mcp.tool()(wireguard_counter_delta)
