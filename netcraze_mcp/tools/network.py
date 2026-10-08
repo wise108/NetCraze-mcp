@@ -4,8 +4,8 @@ import asyncio
 import time
 from typing import Any
 
-from ..client import _get_client
-from ..config import assert_writable
+from ..client import _get_client, _raise_on_rci_errors
+from ..config import assert_writable, save_payload
 
 _WAN_TYPES = frozenset({"UsbQmi", "CdcEthernet", "WifiStation", "Wireguard", "PPTP", "PPPoE", "L2TP"})
 
@@ -287,6 +287,62 @@ async def set_interface_state(name: str, up: bool) -> dict:
         return {"interface": name, "state": action}
 
 
+async def set_interface_tcp_adjust_mss(
+    interface_id: str,
+    mode: str = "pmtu",
+    confirm: bool = False,
+    save: bool = False,
+) -> dict:
+    """Set TCP MSS clamp via structured RCI (no CLI parse / no interface context).
+
+    mode=pmtu → interface.<id>.ip.tcp.adjust-mss.pmtu=true
+    mode=disable → interface.<id>.ip.tcp.adjust-mss.no=true
+
+    Prefer this over apply_cli_batch for WireGuard MSS — CLI ``interface X`` +
+    ``ip tcp adjust-mss`` previously risked destructive rollback (``no interface``).
+    """
+    assert_writable()
+    if not confirm:
+        raise PermissionError("confirm=true is required")
+    iface = (interface_id or "").strip()
+    if not iface:
+        raise ValueError("interface_id is required")
+    mode_s = (mode or "pmtu").strip().lower()
+    if mode_s in ("pmtu", "enable", "on", "true", "1"):
+        adjust: dict = {"pmtu": True}
+        mode_out = "pmtu"
+    elif mode_s in ("disable", "off", "no", "false", "0"):
+        adjust = {"no": True}
+        mode_out = "disable"
+    else:
+        raise ValueError("mode must be pmtu|disable")
+
+    async with _get_client() as client:
+        resp = await client.rci([
+            {"interface": {iface: {"ip": {"tcp": {"adjust-mss": adjust}}}}},
+            *save_payload(save),
+        ])
+        _raise_on_rci_errors(resp)
+        # post-read rc
+        try:
+            rc = await client.rci_get(f"show/rc/interface/{iface}")
+        except Exception:  # noqa: BLE001
+            rc = {}
+        live = None
+        if isinstance(rc, dict):
+            live = ((rc.get("ip") or {}).get("tcp") or {}).get("adjust-mss")
+    return {
+        "ok": True,
+        "interface": iface,
+        "mode": mode_out,
+        "applied_to": "rc",
+        "persisted": bool(save),
+        "adjust_mss": live,
+        "config_saved": save,
+        "note": "Structured RCI — does not use CLI interface context or apply_cli_batch rollback.",
+    }
+
+
 def _interface_to_dict(iface: Any) -> dict:
     if not isinstance(iface, dict):
         return {"raw": iface}
@@ -392,3 +448,4 @@ def register(mcp) -> None:
     mcp.tool()(get_wan_status)
     mcp.tool()(get_wan_speed)
     mcp.tool()(set_interface_state)
+    mcp.tool()(set_interface_tcp_adjust_mss)
