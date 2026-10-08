@@ -192,6 +192,8 @@ def _row_addrs(row: dict) -> set[str]:
 
 
 def _session_from_nat(row: dict) -> dict:
+    from . import sc_rc
+
     packets = int(row.get("packets") or 0)
     packets_out = int(row.get("packets-out") or 0)
     flags_raw = row.get("flags") or []
@@ -203,6 +205,7 @@ def _session_from_nat(row: dict) -> dict:
         flags = []
     if packets > 0 and packets_out == 0 and "UNREPLIED" not in flags:
         flags = [*flags, "UNREPLIED"]
+    dst_out = row.get("dst-out")
     return {
         key: value
         for key, value in {
@@ -212,7 +215,7 @@ def _session_from_nat(row: dict) -> dict:
             "sport": row.get("sport"),
             "dport": row.get("dport"),
             "src_out": row.get("src-out"),
-            "dst_out": row.get("dst-out"),
+            "dst_out": dst_out,
             "sport_out": row.get("sport-out"),
             "dport_out": row.get("dport-out"),
             "packets": packets,
@@ -220,6 +223,8 @@ def _session_from_nat(row: dict) -> dict:
             "bytes": row.get("bytes"),
             "bytes_reply": row.get("bytes-out"),
             "flags": flags or None,
+            "path_class": sc_rc.path_class_from_dst_out(str(dst_out) if dst_out else None),
+            "unreplied": "UNREPLIED" in flags,
         }.items()
         if value is not None
     }
@@ -227,16 +232,33 @@ def _session_from_nat(row: dict) -> dict:
 
 async def get_conntrack(
     host: str = "",
+    src: str = "",
+    dst: str = "",
     port: int | None = None,
     protocol: str = "",
+    path_class: str = "",
+    only_unreplied: bool = False,
+    group_by: str = "",
+    watch_seconds: float = 0,
     limit: int = 50,
 ) -> dict:
     """Filtered live NAT/conntrack sessions from show/ip/nat (read-only).
 
-    Refuses unfiltered dump — pass host and/or port (and optional protocol).
-    Prefer this over show/ip/conntrack text dump. For IKE use get_ike_conntrack.
+    Filters: host (any side) and/or src+dst together, port, protocol,
+    path_class=WG0|WAN|OTHER, only_unreplied, group_by=dst.
+    watch_seconds>0 polls and aggregates short-lived sessions.
+    Limitation: refuses unfiltered dump. For IKE use get_ike_conntrack.
     """
+    import asyncio
+    import time
+
     host_s = (host or "").strip()
+    src_s = (src or "").strip()
+    dst_s = (dst or "").strip()
+    path_s = (path_class or "").strip().upper()
+    if path_s in ("WG", "HAPP", "HAPP/WG"):
+        path_s = "WG0"
+    group_s = (group_by or "").strip().lower()
     proto_s = (protocol or "").strip().upper()
     if proto_s in ("6", "TCP"):
         proto_s = "TCP"
@@ -247,47 +269,114 @@ async def get_conntrack(
     port_i = None if port is None else int(port)
     if port_i is not None and not (1 <= port_i <= 65535):
         raise ValueError("port must be 1..65535")
-    if not host_s and port_i is None:
-        raise ValueError("provide host and/or port (refusing full conntrack dump)")
+    if not host_s and not src_s and not dst_s and port_i is None:
+        raise ValueError("provide host/src/dst and/or port (refusing full conntrack dump)")
     limit = max(1, min(int(limit), 200))
+    watch = max(0.0, float(watch_seconds))
 
-    async with _get_client() as client:
-        nat = await client.rci_get("show/ip/nat")
-    rows = nat if isinstance(nat, list) else []
-    matched: list[dict] = []
-    scanned = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        scanned += 1
+    def _match(row: dict) -> bool:
         if proto_s:
             row_proto = str(row.get("protocol") or "").upper()
             aliases = {"TCP": {"TCP", "6"}, "UDP": {"UDP", "17"}, "ICMP": {"ICMP", "1"}}
             if row_proto not in aliases.get(proto_s, {proto_s}):
-                continue
+                return False
         if host_s and host_s not in _row_addrs(row):
-            continue
+            return False
+        if src_s and str(row.get("src") or "") != src_s and str(row.get("src-out") or "") != src_s:
+            return False
+        if dst_s and str(row.get("dst") or "") != dst_s and str(row.get("dst-out") or "") != dst_s:
+            return False
         if port_i is not None and port_i not in _row_ports(row):
-            continue
-        matched.append(_session_from_nat(row))
-        if len(matched) >= limit:
+            return False
+        return True
+
+    by_key: dict[str, dict] = {}
+    scanned = 0
+    polls = 0
+    deadline = time.monotonic() + watch
+    while True:
+        polls += 1
+        async with _get_client() as client:
+            nat = await client.rci_get("show/ip/nat")
+        rows = nat if isinstance(nat, list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            scanned += 1
+            if not _match(row):
+                continue
+            session = _session_from_nat(row)
+            if path_s and str(session.get("path_class") or "").upper() != path_s:
+                continue
+            if only_unreplied and not session.get("unreplied"):
+                continue
+            key = "|".join([
+                str(session.get("protocol") or ""),
+                str(session.get("src") or ""),
+                str(session.get("dst") or ""),
+                str(session.get("sport") or ""),
+                str(session.get("dport") or ""),
+                str(session.get("dst_out") or ""),
+            ])
+            prev = by_key.get(key)
+            if prev is None:
+                by_key[key] = session
+            else:
+                # keep max packet counters across polls
+                for field in ("packets", "packets_reply", "bytes", "bytes_reply"):
+                    try:
+                        prev[field] = max(int(prev.get(field) or 0), int(session.get(field) or 0))
+                    except (TypeError, ValueError):
+                        pass
+                if session.get("unreplied"):
+                    prev["unreplied"] = True
+                    flags = list(prev.get("flags") or [])
+                    if "UNREPLIED" not in flags:
+                        prev["flags"] = [*flags, "UNREPLIED"]
+        if time.monotonic() >= deadline:
             break
+        await asyncio.sleep(0.4 if watch else 0)
+
+    matched = list(by_key.values())
+    grouped = None
+    if group_s == "dst":
+        buckets: dict[str, list] = {}
+        for item in matched:
+            buckets.setdefault(str(item.get("dst") or "?"), []).append(item)
+        grouped = {
+            dst_key: {
+                "count": len(items),
+                "path_classes": sorted({str(i.get("path_class")) for i in items}),
+                "unreplied": sum(1 for i in items if i.get("unreplied")),
+                "sessions": items[:limit],
+            }
+            for dst_key, items in sorted(buckets.items(), key=lambda kv: -len(kv[1]))
+        }
 
     return redact_value({
         "ok": True,
         "source": "show/ip/nat",
         "filter": {
             "host": host_s or None,
+            "src": src_s or None,
+            "dst": dst_s or None,
             "port": port_i,
             "protocol": proto_s or None,
+            "path_class": path_s or None,
+            "only_unreplied": only_unreplied or None,
+            "group_by": group_s or None,
+            "watch_seconds": watch or None,
             "limit": limit,
         },
         "scanned": scanned,
+        "polls": polls,
         "count": len(matched),
-        "truncated": len(matched) >= limit,
-        "sessions": matched,
+        "truncated": len(matched) > limit,
+        "sessions": matched[:limit],
+        "grouped": grouped,
         "note": (
-            "Structured filter of show/ip/nat (not the noisy show/ip/conntrack text). "
+            "Structured filter of show/ip/nat. path_class from dst_out "
+            "(10.255/10.13 → WG0). watch_seconds aggregates short flows. "
             "IKE UDP/500|4500: prefer get_ike_conntrack(peer=…)."
         ),
     })

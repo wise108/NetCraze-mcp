@@ -185,19 +185,49 @@ async def rollback_hint(snapshot_id: str) -> dict:
     }
 
 
-async def save_config(confirm: bool = False) -> dict:
-    """Explicit system.configuration.save. Requires confirm=true."""
+async def save_config(
+    confirm: bool = False,
+    check_paths: list[str] | None = None,
+) -> dict:
+    """Explicit system.configuration.save + post-check sc==rc for key paths.
+
+    check_paths defaults to domain-lists, dns-routes, wireguard-allowed-ips.
+    Verdict FAILED if dirty remains after save.
+    """
     assert_writable()
     _require_confirm(confirm)
+    paths = check_paths or ["domain-lists", "dns-routes", "wireguard-allowed-ips"]
     async with _get_client() as client:
         resp = await client.rci({"system": {"configuration": {"save": {}}}})
         _raise_on_rci_errors(resp)
+    # brief settle then post-check
+    import asyncio
+    await asyncio.sleep(0.3)
+    from .dns_routes import diff_sc_rc
+    diff = await diff_sc_rc(paths)
+    dirty_parts = []
+    for key, value in (diff.get("diffs") or {}).items():
+        if isinstance(value, dict) and value.get("dirty"):
+            dirty_parts.append(key)
+        if isinstance(value, dict) and value.get("error"):
+            dirty_parts.append(f"{key}:error")
+    if dirty_parts:
+        return diag_report(
+            "FAILED",
+            evidence=["system.configuration.save", {"diff_sc_rc": diff}],
+            changes=["configuration save issued"],
+            config_saved=True,
+            ok=False,
+            dirty_paths=dirty_parts,
+            note="save returned but sc≠rc on checked paths — retry or inspect diff_sc_rc",
+        )
     return diag_report(
         "saved",
-        evidence=["system.configuration.save"],
+        evidence=["system.configuration.save", {"diff_sc_rc": diff}],
         changes=["configuration saved"],
         config_saved=True,
         ok=True,
+        dirty_paths=[],
     )
 
 
