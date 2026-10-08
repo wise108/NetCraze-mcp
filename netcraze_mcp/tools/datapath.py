@@ -444,6 +444,39 @@ async def explain_dns_route(domain: str) -> dict:
     except Exception as exc:  # noqa: BLE001
         resolved = {"error": str(exc).split("\n")[0][:160]}
 
+    policy_hint = None
+    try:
+        from .policy import get_policy_tables
+        tables = await get_policy_tables()
+        iface = (primary or {}).get("interface")
+        for table in tables.get("tables") or []:
+            if iface and (
+                table.get("id") == iface
+                or any(
+                    (lr or {}).get("interface") == iface
+                    for lr in (table.get("linked_dns_proxy_routes") or [])
+                )
+            ):
+                policy_hint = {
+                    "table_id": table.get("id"),
+                    "table4": table.get("table4"),
+                    "fwmark": table.get("fwmark") or table.get("mark"),
+                    "ON_LINK_DEFAULT": table.get("ON_LINK_DEFAULT"),
+                    "materialized_default": table.get("materialized_default"),
+                }
+                break
+    except Exception as exc:  # noqa: BLE001
+        policy_hint = {"error": str(exc).split("\n")[0][:160]}
+
+    via = (
+        f"dns-proxy → {(primary or {}).get('interface')}"
+        if primary else "no dns-proxy match (system/default DNS path)"
+    )
+    if policy_hint and policy_hint.get("fwmark"):
+        via = f"{via}; fwmark={policy_hint.get('fwmark')} table4={policy_hint.get('table4')}"
+        if policy_hint.get("ON_LINK_DEFAULT"):
+            via = f"{via}; ON_LINK_DEFAULT"
+
     return redact_value({
         "ok": True,
         "domain": name,
@@ -454,17 +487,107 @@ async def explain_dns_route(domain: str) -> dict:
             "interface": (primary or {}).get("interface"),
             "gateway": (primary or {}).get("gateway"),
             "auto": (primary or {}).get("auto"),
-            "via": (
-                f"dns-proxy → {(primary or {}).get('interface')}"
-                if primary else "no dns-proxy match (system/default DNS path)"
-            ),
-        } if True else None,
+            "via": via,
+        },
+        "policy": policy_hint,
         "resolved_addresses": resolved,
         "note": (
             "Matching is suffix-based on object-group FQDN includes. "
-            "Actual client lookups also depend on dns-proxy intercept and order."
+            "policy includes fwmark/table when dns-proxy auto-table is present."
         ),
     })
+
+
+async def diagnose_dns_proxy_route(list_name: str) -> dict:
+    """Compare dns-proxy route config vs materialized policy table (ON_LINK_DEFAULT)."""
+    from .dns_routes import _fetch_fqdn_groups, _read_list_entries, _resolve_list_key
+    from .policy import get_policy_tables
+    from .report import diag_report
+
+    name = (list_name or "").strip()
+    if not name:
+        raise ValueError("list_name is required")
+
+    routes = await get_dns_routes()
+    matched_routes = [
+        r for r in routes
+        if r.get("list_name") == name or r.get("list_key") == name
+    ]
+    async with _get_client() as client:
+        key = await _resolve_list_key(client, name)
+        description, entries = await _read_list_entries(client, key)
+
+    fqdn_entries = []
+    cidr_entries = []
+    for entry in entries:
+        try:
+            ipaddress.ip_network(entry, strict=False)
+            cidr_entries.append(entry)
+        except ValueError:
+            fqdn_entries.append(entry)
+
+    tables = await get_policy_tables()
+    related = []
+    on_link = False
+    for table in tables.get("tables") or []:
+        linked = table.get("linked_dns_proxy_routes") or []
+        if any(
+            (lr or {}).get("list_name") == description
+            or (lr or {}).get("list_key") == key
+            for lr in linked
+        ):
+            related.append(table)
+            if table.get("ON_LINK_DEFAULT"):
+                on_link = True
+        else:
+            # match by interface of dns route
+            for mr in matched_routes:
+                if mr.get("interface") and (
+                    table.get("id") == mr.get("interface")
+                    or any(
+                        (d or {}).get("interface") == mr.get("interface")
+                        for d in (table.get("materialized_default") or [])
+                    )
+                ):
+                    related.append(table)
+                    if table.get("ON_LINK_DEFAULT"):
+                        on_link = True
+
+    configured_gw = next((r.get("gateway") for r in matched_routes if r.get("gateway")), None)
+    evidence = [
+        {"dns_routes": matched_routes},
+        {"list": {"name": description, "key": key, "fqdn": fqdn_entries[:50], "cidr": cidr_entries}},
+        {"policy_tables": related},
+        {"ON_LINK_DEFAULT": on_link},
+        {"configured_gateway": configured_gw},
+    ]
+    if on_link and configured_gw and configured_gw not in ("0.0.0.0", ""):
+        verdict = "ON_LINK_DEFAULT"
+        note = (
+            f"Configured gateway {configured_gw} but table has 0.0.0.0/0 via 0.0.0.0 "
+            f"<iface> — NDMS 5.1.6 ignores gateway for FQDN→VPN (e.g. ZeroTier0). "
+            f"Workaround: plan_fqdn_static_sync /32 routes."
+        )
+    elif not matched_routes:
+        verdict = "no_route"
+        note = "No dns-proxy route for this list"
+    else:
+        verdict = "ok"
+        note = "Policy table matches configured dns-proxy route (no ON_LINK_DEFAULT detected)"
+
+    return diag_report(
+        verdict,
+        evidence=evidence,
+        changes=[],
+        config_saved=False,
+        ok=verdict == "ok",
+        list_name=description,
+        list_key=key,
+        fqdn_only=bool(fqdn_entries) and not cidr_entries,
+        has_cidr=bool(cidr_entries),
+        ON_LINK_DEFAULT=on_link,
+        note=note,
+    )
 
 
 async def explain_route(destination: str = "", source: str = "") -> dict:
@@ -574,3 +697,4 @@ def register(mcp) -> None:
     mcp.tool()(router_http_speed)
     mcp.tool()(explain_dns_route)
     mcp.tool()(explain_route)
+    mcp.tool()(diagnose_dns_proxy_route)

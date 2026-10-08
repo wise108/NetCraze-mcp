@@ -170,6 +170,199 @@ async def get_policy_routing_summary() -> dict:
     })
 
 
+_FWMARK_TABLE_RE = __import__("re").compile(
+    r"fwmark\s+(0x[0-9a-fA-F]+)(?:/\S+)?\s+lookup\s+(\d+)",
+    __import__("re").I,
+)
+
+
+def _extract_parse_routes(resp: Any) -> list[dict]:
+    """Pull route list from RCI parse response (show ip route table N)."""
+    found: list[dict] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            routes = value.get("route")
+            if isinstance(routes, list):
+                found.extend(r for r in routes if isinstance(r, dict))
+            elif isinstance(routes, dict):
+                found.extend(r for r in routes.values() if isinstance(r, dict))
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(resp)
+    return found
+
+
+def _defaults_and_on_link(routes: list[dict]) -> tuple[list[dict], bool]:
+    defaults = []
+    on_link = False
+    for r in routes:
+        dest = str(r.get("destination") or "")
+        if dest in ("0.0.0.0/0", "default") or dest.startswith("0.0.0.0"):
+            gw = str(r.get("gateway") or "")
+            iface = r.get("interface")
+            defaults.append({
+                "destination": dest,
+                "gateway": gw or None,
+                "interface": iface,
+                "metric": r.get("metric"),
+            })
+            # ON_LINK_DEFAULT: default via 0.0.0.0 on iface (gateway ignored by NDMS)
+            if gw in ("", "0.0.0.0", "None") and iface:
+                on_link = True
+    return defaults, on_link
+
+
+async def get_policy_tables() -> dict:
+    """Dump policy/auto tables (4097+), fwmark, linked dns-proxy routes, defaults.
+
+    NDMS 5.1.6 often returns empty show/ip/policy. Source of truth:
+    show/ip/rule (fwmark→lookup N) + ``show ip route table N`` via parse.
+    """
+    async with _get_client() as client:
+        policies = None
+        policies_error = None
+        try:
+            policies = await client.rci_get("show/ip/policy")
+        except Exception as exc:  # noqa: BLE001
+            policies_error = str(exc).split("\n")[0][:200]
+        rules_raw = None
+        try:
+            rules_raw = await client.rci_get("show/ip/rule")
+        except Exception as exc:  # noqa: BLE001
+            rules_raw = str(exc)
+
+        # tables from ip rule fwmark lookups (auto dns-proxy tables)
+        rule_text = rules_raw if isinstance(rules_raw, str) else (
+            "\n".join(str(x) for x in rules_raw) if isinstance(rules_raw, list) else ""
+        )
+        mark_tables: dict[int, str] = {}
+        for match in _FWMARK_TABLE_RE.finditer(rule_text or ""):
+            mark, table_s = match.group(1), match.group(2)
+            table_n = int(table_s)
+            if table_n >= 4096:
+                mark_tables[table_n] = mark.lower()
+
+        table_routes: dict[int, list[dict]] = {}
+        for table_n in sorted(mark_tables):
+            try:
+                resp = await client.rci([
+                    {"parse": "exit"},
+                    {"parse": f"show ip route table {table_n}"},
+                    {"parse": "exit"},
+                ])
+                table_routes[table_n] = _extract_parse_routes(resp)
+            except Exception:  # noqa: BLE001
+                table_routes[table_n] = []
+
+    try:
+        dns_routes = await get_dns_routes()
+    except Exception as exc:  # noqa: BLE001
+        dns_routes = []
+        dns_error = str(exc).split("\n")[0][:160]
+    else:
+        dns_error = None
+
+    tables: list[dict] = []
+    seen_table_ids: set[int] = set()
+
+    # 1) From ip rule + show ip route table N (primary on NDMS 5.1.6)
+    for table_n, fwmark in mark_tables.items():
+        routes = table_routes.get(table_n) or []
+        defaults, on_link_default = _defaults_and_on_link(routes)
+        default_ifaces = {
+            str(d.get("interface")) for d in defaults if d.get("interface")
+        }
+        linked = [
+            dr for dr in (dns_routes if isinstance(dns_routes, list) else [])
+            if isinstance(dr, dict) and dr.get("interface") in default_ifaces
+        ]
+        tables.append({
+            "id": f"table{table_n}",
+            "description": None,
+            "mark": fwmark,
+            "fwmark": fwmark,
+            "table4": table_n,
+            "auto_table": table_n >= 4097,
+            "materialized_default": defaults,
+            "ON_LINK_DEFAULT": on_link_default,
+            "linked_dns_proxy_routes": linked[:10],
+            "route_count": len(routes),
+            "source": "ip-rule+show-ip-route-table",
+        })
+        seen_table_ids.add(table_n)
+
+    # 2) Merge any show/ip/policy entries (when firmware populates them)
+    if isinstance(policies, dict):
+        for name, pol in policies.items():
+            if not isinstance(pol, dict):
+                continue
+            routes = ((pol.get("route4") or {}).get("route") if isinstance(pol.get("route4"), dict) else None) or []
+            if isinstance(routes, dict):
+                routes = list(routes.values())
+            if not isinstance(routes, list):
+                routes = [routes] if routes else []
+            defaults, on_link_default = _defaults_and_on_link(routes)
+            mark = pol.get("mark")
+            table4 = pol.get("table4")
+            if isinstance(table4, int) and table4 in seen_table_ids:
+                # enrich existing entry
+                for entry in tables:
+                    if entry.get("table4") == table4:
+                        entry["id"] = name
+                        entry["description"] = pol.get("description")
+                        if mark:
+                            entry["mark"] = mark
+                        break
+                continue
+            linked = [
+                dr for dr in (dns_routes if isinstance(dns_routes, list) else [])
+                if isinstance(dr, dict) and (
+                    dr.get("interface") == name
+                    or str(dr.get("interface") or "") == str(pol.get("description") or "")
+                    or dr.get("interface") in {
+                        str(d.get("interface")) for d in defaults if d.get("interface")
+                    }
+                )
+            ]
+            tables.append({
+                "id": name,
+                "description": pol.get("description"),
+                "mark": mark,
+                "fwmark": (
+                    f"0x{mark}" if isinstance(mark, str) and mark and not str(mark).startswith("0x")
+                    else mark
+                ),
+                "table4": table4,
+                "auto_table": isinstance(table4, int) and table4 >= 4097,
+                "materialized_default": defaults,
+                "ON_LINK_DEFAULT": on_link_default,
+                "linked_dns_proxy_routes": linked[:10],
+                "route_count": len(routes),
+                "source": "show/ip/policy",
+            })
+
+    rule_lines = [ln for ln in (rule_text or "").splitlines() if ln.strip()][:80]
+
+    return redact_value({
+        "ok": True,
+        "tables": tables,
+        "ip_rules": rule_lines or None,
+        "dns_routes_error": dns_error,
+        "policies_error": policies_error,
+        "note": (
+            "Tables from show/ip/rule fwmark lookups + show ip route table N "
+            "(show/ip/policy is often empty on NDMS 5.1.6). "
+            "ON_LINK_DEFAULT = 0.0.0.0/0 via 0.0.0.0 <iface> while dns-proxy has a gateway."
+        ),
+    })
+
+
 def register(mcp) -> None:
     mcp.tool()(get_connection_priorities)
     mcp.tool()(get_policy_routing_summary)
+    mcp.tool()(get_policy_tables)
