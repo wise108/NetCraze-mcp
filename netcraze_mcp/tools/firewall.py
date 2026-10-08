@@ -293,7 +293,213 @@ async def get_conntrack(
     })
 
 
+async def get_access_list(name: str) -> dict:
+    """Return body of one ACL (e.g. _WEBADMIN_ZeroTier0), not just names."""
+    needle = (name or "").strip()
+    if not needle:
+        raise ValueError("name is required")
+    async with _get_client() as client:
+        acls = await client.rci_get("show/sc/access-list")
+        # try detailed show
+        detailed = None
+        try:
+            detailed = await client.rci({"show": {"ip": {"access-list": needle}}})
+        except Exception:  # noqa: BLE001
+            detailed = None
+    entries = []
+    if isinstance(acls, list):
+        for item in acls:
+            if not isinstance(item, dict):
+                continue
+            acl_name = str(item.get("acl") or item.get("name") or "")
+            if acl_name == needle or needle in acl_name:
+                entries.append(redact_value(item))
+    elif isinstance(acls, dict):
+        if needle in acls:
+            entries.append(redact_value(acls[needle]))
+        else:
+            for key, value in acls.items():
+                if needle in str(key) and isinstance(value, (dict, list)):
+                    entries.append(redact_value({"acl": key, "body": value}))
+    return redact_value({
+        "ok": True,
+        "name": needle,
+        "entries": entries,
+        "count": len(entries),
+        "detailed": redact_value(detailed) if detailed else None,
+        "note": "Read-only ACL dump. Use add_acl_rule/remove_acl_rule to change.",
+    })
+
+
+async def add_acl_rule(
+    acl: str,
+    action: str = "permit",
+    protocol: str = "udp",
+    source: str = "any",
+    destination: str = "any",
+    port: int | None = None,
+    confirm: bool = False,
+    save: bool = False,
+) -> dict:
+    """Add one ACL rule via apply_cli_batch. save=False by default."""
+    from ..config import assert_writable
+    from .txn import apply_cli_batch
+
+    assert_writable()
+    if not confirm:
+        raise PermissionError("confirm=true is required")
+    acl_name = acl.strip()
+    if not acl_name:
+        raise ValueError("acl is required")
+    action_s = action.strip().lower()
+    if action_s not in ("permit", "deny"):
+        raise ValueError("action must be permit|deny")
+    proto = protocol.strip().lower()
+    parts = [action_s, proto, source.strip() or "any", destination.strip() or "any"]
+    if port is not None:
+        parts.extend(["eq", str(int(port))])
+    # NDMS access-list syntax varies; use parse form
+    cmd = f"ip access-list {acl_name} {' '.join(parts)}"
+    return await apply_cli_batch(
+        commands=[cmd],
+        confirm=True,
+        verify=[f"show ip access-list {acl_name}"],
+        rollback_on_fail=True,
+        save=save,
+    )
+
+
+async def remove_acl_rule(
+    acl: str,
+    action: str = "permit",
+    protocol: str = "udp",
+    source: str = "any",
+    destination: str = "any",
+    port: int | None = None,
+    confirm: bool = False,
+    save: bool = False,
+) -> dict:
+    """Remove one ACL rule via ``no …`` parse. save=False by default."""
+    from ..config import assert_writable
+    from .txn import apply_cli_batch
+
+    assert_writable()
+    if not confirm:
+        raise PermissionError("confirm=true is required")
+    acl_name = acl.strip()
+    action_s = action.strip().lower()
+    proto = protocol.strip().lower()
+    parts = [action_s, proto, source.strip() or "any", destination.strip() or "any"]
+    if port is not None:
+        parts.extend(["eq", str(int(port))])
+    cmd = f"no ip access-list {acl_name} {' '.join(parts)}"
+    return await apply_cli_batch(
+        commands=[cmd],
+        confirm=True,
+        verify=[],
+        rollback_on_fail=False,
+        save=save,
+    )
+
+
+async def get_interface_security(interface: str) -> dict:
+    """security-level + bound ACLs + whether inbound UDP/<hint> to router is plausible."""
+    iface = (interface or "").strip()
+    if not iface:
+        raise ValueError("interface is required")
+    async with _get_client() as client:
+        data = await client.rci_get(f"show/interface/{iface}")
+        acls = None
+        try:
+            acls = await client.rci_get("show/sc/access-list")
+        except Exception:  # noqa: BLE001
+            acls = None
+    if not isinstance(data, dict) or not data:
+        return {"ok": False, "error": f"interface not found: {iface}"}
+    level = data.get("security-level")
+    bound = []
+    acl_list = acls if isinstance(acls, list) else []
+    for item in acl_list if isinstance(acl_list, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("acl") or item.get("name") or "")
+        if name == f"_WEBADMIN_{iface}" or iface in name:
+            bound.append(redact_value(item))
+    return redact_value({
+        "ok": True,
+        "interface": iface,
+        "security_level": level,
+        "bound_acls": bound,
+        "inbound_udp_hint": (
+            "security-level public typically blocks unsolicited inbound to the router; "
+            "permit rules needed on _WEBADMIN_<iface> for WG/IPsec listen ports"
+            if str(level).lower() in ("public", "true") or level is True
+            else "check bound ACL for explicit permit udp"
+        ),
+    })
+
+
+async def check_udp_listen(port: int) -> dict:
+    """Honest UDP listen probe: NDMS has no socket listing — return unsupported + indirect signs."""
+    port_i = int(port)
+    if not (1 <= port_i <= 65535):
+        raise ValueError("port must be 1..65535")
+    async with _get_client() as client:
+        ifaces = await client.rci_get("show/interface")
+        forwards = None
+        try:
+            forwards = await client.rci_get("show/sc/ip/static")
+        except Exception:  # noqa: BLE001
+            forwards = None
+        acls = None
+        try:
+            acls = await client.rci_get("show/sc/access-list")
+        except Exception:  # noqa: BLE001
+            acls = None
+
+    wg_ports = []
+    items = ifaces.values() if isinstance(ifaces, dict) else (ifaces if isinstance(ifaces, list) else [])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "Wireguard" and not str(item.get("id") or "").startswith("Wireguard"):
+            continue
+        lp = (item.get("wireguard") or {}).get("listen-port")
+        if lp is not None and int(lp) == port_i:
+            wg_ports.append(item.get("id"))
+
+    pf = []
+    raw_static = forwards if isinstance(forwards, list) else []
+    for item in raw_static:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("port") or "") == str(port_i) or str(item.get("to-port") or "") == str(port_i):
+            pf.append(redact_value(item))
+
+    return {
+        "ok": False,
+        "unsupported": True,
+        "port": port_i,
+        "reason": "NDMS RCI does not expose listening UDP sockets",
+        "indirect": {
+            "wireguard_listen_port_matches": wg_ports,
+            "port_forwards": pf[:10],
+            "acl_mentions": [
+                redact_value(item)
+                for item in (acls if isinstance(acls, list) else [])[:50]
+                if isinstance(item, dict) and str(port_i) in str(item)
+            ][:10],
+        },
+        "note": "Use wireguard_handshake_check / capture_flow_summary as path proof.",
+    }
+
+
 def register(mcp) -> None:
     mcp.tool()(list_firewall_rules)
     mcp.tool()(list_nat_rules)
     mcp.tool()(get_conntrack)
+    mcp.tool()(get_access_list)
+    mcp.tool()(add_acl_rule)
+    mcp.tool()(remove_acl_rule)
+    mcp.tool()(get_interface_security)
+    mcp.tool()(check_udp_listen)

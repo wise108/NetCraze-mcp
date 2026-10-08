@@ -180,6 +180,8 @@ async def get_wan_details() -> dict:
     else:
         behind_nat = "unknown"
 
+    behind_cgnat_or_cpe = bool(private is True)
+
     dns_isp: list[str] = []
     # DHCP-learned DNS sometimes appears on interface; also check name-server empty note
     for key in ("dns", "name-server", "nameserver"):
@@ -216,6 +218,12 @@ async def get_wan_details() -> dict:
         "public_ipv4": public_ip,
         "public_ip_source": public_source,
         "behind_nat": behind_nat,
+        "BEHIND_CGNAT_OR_CPE": behind_cgnat_or_cpe,
+        "inbound_udp_note": (
+            "WAN address is private (CPE/CGNAT). Inbound UDP will not reach the router "
+            "without a port-forward on the upstream CPE."
+            if behind_cgnat_or_cpe else None
+        ),
         "internet": {
             key: value
             for key, value in {
