@@ -11,11 +11,21 @@ from typing import Any
 
 import httpx
 
+from .config import RouterSpec, get_router
+from .router_ctx import get_current_router
+
 logger = logging.getLogger("netcraze_mcp")
+
+RCI_AUTH_FAILED = "RCI_AUTH_FAILED"
+RCI_FORBIDDEN_BY_SECURITY_LEVEL = "RCI_FORBIDDEN_BY_SECURITY_LEVEL"
 
 
 class NetCrazeError(RuntimeError):
     """Typed router/API error with actionable message (timeout/auth/HTTP)."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class NetCrazeClient:
@@ -29,25 +39,75 @@ class NetCrazeClient:
         *,
         timeout: float = 15.0,
         connect_timeout: float = 8.0,
+        scheme: str = "http",
+        port: int | None = None,
+        verify_tls: bool = True,
+        fallback_hosts: list[str] | None = None,
+        alias: str = "",
     ) -> None:
+        self._spec = RouterSpec(
+            alias=alias or "default",
+            host=host,
+            user=user,
+            password=password,
+            scheme=scheme,
+            port=port,
+            verify_tls=verify_tls,
+            fallback_hosts=list(fallback_hosts or []),
+            timeout=timeout,
+            connect_timeout=connect_timeout,
+        )
         self._host = host
         self._user = user
         self._password = password
         self._timeout = httpx.Timeout(timeout, connect=connect_timeout)
         self._http: httpx.AsyncClient | None = None
+        self.path_used: str | None = None
+        self.connected_via: str | None = None
+
+    @classmethod
+    def from_spec(cls, spec: RouterSpec) -> "NetCrazeClient":
+        return cls(
+            host=spec.host,
+            user=spec.user,
+            password=spec.password,
+            timeout=spec.timeout,
+            connect_timeout=spec.connect_timeout,
+            scheme=spec.scheme,
+            port=spec.port,
+            verify_tls=spec.verify_tls,
+            fallback_hosts=spec.fallback_hosts,
+            alias=spec.alias,
+        )
 
     async def __aenter__(self) -> "NetCrazeClient":
-        self._http = httpx.AsyncClient(
-            base_url=f"http://{self._host}",
-            timeout=self._timeout,
+        errors: list[str] = []
+        for candidate in self._spec.host_candidates():
+            base = self._spec.base_url_for(candidate)
+            self._http = httpx.AsyncClient(
+                base_url=base,
+                timeout=self._timeout,
+                verify=self._spec.verify_tls,
+            )
+            try:
+                await self._auth()
+                self._host = candidate
+                self.path_used = base
+                self.connected_via = candidate
+                return self
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{base}: {exc}")
+                if self._http is not None:
+                    await self._http.aclose()
+                    self._http = None
+                # Do not try fallbacks for security-level forbid (same ACL likely)
+                if isinstance(exc, NetCrazeError) and exc.code == RCI_FORBIDDEN_BY_SECURITY_LEVEL:
+                    raise
+                continue
+        raise NetCrazeError(
+            "All router hosts failed: " + " | ".join(errors[:5]),
+            code=RCI_AUTH_FAILED if errors else None,
         )
-        try:
-            await self._auth()
-        except Exception:
-            await self._http.aclose()
-            self._http = None
-            raise
-        return self
 
     async def __aexit__(self, *_: Any) -> None:
         if self._http is not None:
@@ -71,15 +131,27 @@ class NetCrazeClient:
             )
         if isinstance(exc, httpx.HTTPStatusError):
             code = exc.response.status_code
+            err_code = None
             hint = ""
             if code in (401, 403):
-                hint = " — auth failed (check NETCRAZE_USER/NETCRAZE_PASS or session expired)"
+                challenge = exc.response.headers.get("X-NDM-Challenge", "")
+                if code == 403 and not challenge and path.rstrip("/").endswith("auth"):
+                    err_code = RCI_FORBIDDEN_BY_SECURITY_LEVEL
+                    hint = (
+                        " — RCI_FORBIDDEN_BY_SECURITY_LEVEL: interface ACL/security-level "
+                        "blocked /auth (e.g. ZeroTier0 public or missing permit in "
+                        "_WEBADMIN_<iface>); not a wrong password"
+                    )
+                else:
+                    err_code = RCI_AUTH_FAILED
+                    hint = " — auth failed (check NETCRAZE_USER/NETCRAZE_PASS or session expired)"
             elif code == 404:
                 hint = " — RCI path not found on this firmware"
             body = (exc.response.text or "")[:120].replace("\n", " ")
             return NetCrazeError(
                 f"HTTP {code} {method} {path} on {host}{hint}"
-                + (f": {body}" if body else "")
+                + (f": {body}" if body else ""),
+                code=err_code,
             )
         return NetCrazeError(f"{type(exc).__name__} on {host} ({method} {path}): {exc}")
 
@@ -91,12 +163,22 @@ class NetCrazeClient:
             raise self._wrap_http_error(exc, method="GET", path="/auth") from exc
         if resp.status_code == 200:
             return
-        realm = resp.headers.get("X-NDM-Realm", "")
         challenge = resp.headers.get("X-NDM-Challenge", "")
+        realm = resp.headers.get("X-NDM-Realm", "")
         if not challenge:
+            if resp.status_code == 403:
+                raise NetCrazeError(
+                    f"RCI_FORBIDDEN_BY_SECURITY_LEVEL on {self._host}: "
+                    f"GET /auth returned 403 without X-NDM-Challenge — "
+                    f"security-level/ACL on the ingress interface is blocking admin RCI "
+                    f"(check _WEBADMIN_<iface> and interface security-level; "
+                    f"not a password problem)",
+                    code=RCI_FORBIDDEN_BY_SECURITY_LEVEL,
+                )
             raise NetCrazeError(
                 f"Auth challenge missing from {self._host} "
-                f"(HTTP {resp.status_code}) — is this a NetCraze/Keenetic RCI?"
+                f"(HTTP {resp.status_code}) — is this a NetCraze/Keenetic RCI?",
+                code=RCI_AUTH_FAILED,
             )
         md5 = hashlib.md5(
             f"{self._user}:{realm}:{self._password}".encode()
@@ -223,20 +305,40 @@ class NetCrazeClient:
             raise self._wrap_http_error(exc, method="POST", path=f"/rci/{clean}") from exc
 
 
-def _get_client() -> NetCrazeClient:
-    host = os.environ.get("NETCRAZE_HOST", "")
-    user = os.environ.get("NETCRAZE_USER", "admin")
-    password = os.environ.get("NETCRAZE_PASS", "")
-    if not host:
-        raise NetCrazeError(
-            "NETCRAZE_HOST environment variable is not set. "
-            "Example: NETCRAZE_HOST=192.168.1.1"
-        )
-    if not password:
-        raise NetCrazeError(
-            "NETCRAZE_PASS environment variable is not set."
-        )
-    return NetCrazeClient(host=host, user=user, password=password)
+def _get_client(router: str | None = None) -> NetCrazeClient:
+    alias = (router if router is not None else get_current_router()) or ""
+    # Prefer registry; fall back to legacy env for empty registry edge cases
+    try:
+        from .config import load_routers
+        load_routers(force=True)  # pick up env changes between calls/tests
+        spec = get_router(alias or None)
+        if not (spec.host or "").strip():
+            raise NetCrazeError(
+                "NETCRAZE_HOST environment variable is not set. "
+                "Example: NETCRAZE_HOST=192.168.1.1"
+            )
+        if not spec.password:
+            raise NetCrazeError(
+                "NETCRAZE_PASS environment variable is not set."
+            )
+        return NetCrazeClient.from_spec(spec)
+    except NetCrazeError:
+        raise
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "No routers" in msg or "password" in msg.lower():
+            host = os.environ.get("NETCRAZE_HOST", "")
+            password = os.environ.get("NETCRAZE_PASS", "")
+            if not host:
+                raise NetCrazeError(
+                    "NETCRAZE_HOST environment variable is not set. "
+                    "Example: NETCRAZE_HOST=192.168.1.1"
+                ) from exc
+            if not password:
+                raise NetCrazeError(
+                    "NETCRAZE_PASS environment variable is not set."
+                ) from exc
+        raise NetCrazeError(msg) from exc
 
 
 def _sanitize_error(e: Exception) -> str:
